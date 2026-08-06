@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Kept in sync with ui/theme/Color.kt. These exist only so the window
+         background matches the Compose surface before the first frame. -->
+    <color name="gonomad_ink">#FF0E1116</color>
+    <color name="gonomad_accent">#FF5EC8C0</color>
+    <color name="ic_launcher_background">#FF11161D</color>
+</resources>

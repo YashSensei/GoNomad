@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- A bare platform theme: all real styling lives in Compose
+         (ui/theme/Theme.kt). This exists to stop the white flash between
+         process start and the first composition. -->
+    <style name="Theme.GoNomad" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/gonomad_ink</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

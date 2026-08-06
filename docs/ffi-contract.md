@@ -65,6 +65,12 @@ data class TerminalFrame(
     val cursorCol: UShort,
 )
 
+/** A newly spawned terminal and its first screen. */
+data class TerminalHandle(
+    val ptyId: ULong,
+    val initial: TerminalFrame,
+)
+
 sealed class GonomadError : Exception() {
     data class Denied(val capability: String) : GonomadError()
     object NotFound : GonomadError()
@@ -78,6 +84,14 @@ sealed class GonomadError : Exception() {
 
 ## The client object
 
+> [!IMPORTANT]
+> **The Kotlin side must code against an `interface`, not this class.**
+> UniFFI generates a concrete class, and a Kotlin interface cannot declare a
+> `companion object`. So `create` lives on a separate `ClientProvider`, and the
+> interface carries instance methods only; the generated class satisfies it
+> structurally. That indirection is also what lets a fake be substituted for
+> previews and for building the app before the Rust core exists.
+
 ```kotlin
 class GonomadClient {
     companion object {
@@ -85,10 +99,16 @@ class GonomadClient {
         fun create(stateDir: String): GonomadClient
     }
 
-    /** True once this device has completed pairing with some daemon. */
+    /**
+     * True once this device has completed pairing with some daemon.
+     *
+     * Synchronous, so the implementation must answer from memory. Reading the
+     * Keystore here would put a disk-and-keymaster round trip on whatever thread
+     * calls it; load once at construction and cache.
+     */
     fun isPaired(): Boolean
 
-    /** The stored daemon, if paired. */
+    /** The stored daemon, if paired. Synchronous, as [isPaired]. */
     fun pairedDaemon(): DeviceInfo?
 
     /**
@@ -101,7 +121,20 @@ class GonomadClient {
      */
     suspend fun beginPairing(qrPayload: String): String   // the SAS, e.g. "418 273"
 
-    /** Commits the pairing after the user confirmed the SAS matched. */
+    /**
+     * Commits the pairing after the user confirmed the SAS matched.
+     *
+     * `deviceName` is **this phone's** name, as it will appear in the daemon's
+     * device list and audit log — not the daemon's name. The daemon's own name
+     * comes back from [pairedDaemon].
+     *
+     * Implementation constraint (`ARCHITECTURE.md` §19 R24): with `IKpsk2` the
+     * daemon completes its side of the handshake even when the pairing code was
+     * wrong, so this call MUST perform an authenticated application-level
+     * exchange over the control stream and only report success if that
+     * round-trips. Treating handshake completion as success would register a
+     * device that guessed nothing.
+     */
     suspend fun confirmPairing(deviceName: String)
 
     /** Abandons an in-progress pairing (SAS mismatch, or user cancelled). */
@@ -111,7 +144,15 @@ class GonomadClient {
     fun disconnect()
     fun status(): Status
 
-    /** Emits on every connection-state change. Backed by a Rust callback. */
+    /**
+     * Emits on every connection-state change. Backed by a Rust callback.
+     *
+     * **Single registration.** The Rust side holds exactly one listener, so
+     * calling this twice replaces the first — a second call site would silently
+     * stop the first from receiving anything. Register once in a process-wide
+     * repository and fan out to consumers with a `SharedFlow`. Do not wrap this
+     * in a per-call-site `callbackFlow`.
+     */
     fun observeStatus(listener: StatusListener)
 
     // --- filesystem ---
@@ -120,10 +161,20 @@ class GonomadClient {
     suspend fun workspaceRoots(): List<String>
 
     // --- terminal ---
-    suspend fun spawnTerminal(cwd: String?): ULong
+    /**
+     * Spawns a terminal and returns its first frame along with its id.
+     *
+     * Returns the frame rather than only the id so the UI can distinguish
+     * "spawned, no output yet" from "spawned, first frame lost" — with an id
+     * alone those two are indistinguishable and the screen stays blank forever.
+     */
+    suspend fun spawnTerminal(cwd: String?): TerminalHandle
+
     suspend fun sendInput(ptyId: ULong, data: String)
     suspend fun resizeTerminal(ptyId: ULong, cols: UShort, rows: UShort)
     suspend fun closeTerminal(ptyId: ULong)
+
+    /** Single registration, exactly as [observeStatus]. */
     fun observeTerminal(listener: TerminalListener)
 
     /** Forgets the daemon and wipes local keys. */

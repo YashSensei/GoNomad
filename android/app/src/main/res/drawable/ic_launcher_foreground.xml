@@ -1,0 +1,19 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- A shell prompt: the product is a terminal-shaped thing, not a screen
+         mirror. Kept inside the 72dp adaptive-icon safe zone. -->
+    <path
+        android:pathData="M37,41 L51,54 L37,67"
+        android:strokeColor="#5EC8C0"
+        android:strokeWidth="7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M59,68 L75,68"
+        android:strokeColor="#9BA6B4"
+        android:strokeWidth="7"
+        android:strokeLineCap="round" />
+</vector>

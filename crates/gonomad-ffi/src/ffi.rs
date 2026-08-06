@@ -605,6 +605,38 @@ impl GonomadClient {
         })
     }
 
+    /// Lists the terminals still running on the machine.
+    ///
+    /// Call this after connecting. The machine owns the terminals, so they are
+    /// still running after a disconnect, an app restart, or a phone reboot — this
+    /// is how the app finds them again.
+    ///
+    /// # Errors
+    ///
+    /// [`GonomadError::Transport`] when there is no live connection.
+    pub async fn list_terminals(&self) -> Result<Vec<u64>, GonomadError> {
+        Ok(self.core.list_terminals().await?)
+    }
+
+    /// Reattaches to a terminal already running on the machine.
+    ///
+    /// The counterpart to [`Self::spawn_terminal`], and what makes background
+    /// terminals *usable* rather than merely alive: without it, the machine keeps
+    /// a build running exactly as designed while the phone has no route back to
+    /// it, which from the user's chair is indistinguishable from losing the work.
+    ///
+    /// Returns the terminal's current screen, so a restored tab renders
+    /// immediately instead of sitting blank for a poll interval.
+    ///
+    /// # Errors
+    ///
+    /// [`GonomadError::NotFound`] if the terminal has since exited and been
+    /// reaped — the normal outcome for a stale id from a previous session, and
+    /// the signal to drop that tab.
+    pub async fn attach_terminal(&self, pty_id: u64) -> Result<TerminalFrame, GonomadError> {
+        Ok(self.core.attach_terminal(pty_id).await?.into())
+    }
+
     /// Sends input to a terminal. Control characters are how `Ctrl-C` is sent.
     ///
     /// # Errors

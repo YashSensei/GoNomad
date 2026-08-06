@@ -41,8 +41,8 @@ use std::time::Duration;
 use gonomad_core::{DeviceIdentity, PairingError, PairingTicket, Sas};
 use gonomad_proto::methods::{
     method, DirEntry, Empty, FsListParams, FsListResult, FsReadParams, FsReadResult, PtyIdParams,
-    PtyInputParams, PtyResizeParams, PtySpawnParams, PtySpawnResult, ScreenFrame, SysInfoParams,
-    SysInfoResult, SysRegisterParams, SysRegisterResult,
+    PtyInputParams, PtyListResult, PtyResizeParams, PtySpawnParams, PtySpawnResult, ScreenFrame,
+    SysInfoParams, SysInfoResult, SysRegisterParams, SysRegisterResult,
 };
 use gonomad_proto::{
     ControlMessage, CorrelationId, Frame, FrameFlags, Hello, HelloOk, ProtoError, PublicKey,
@@ -762,6 +762,40 @@ impl Inner {
         Ok(spawned)
     }
 
+    /// Lists the terminals the daemon currently has running.
+    async fn list_terminals(&self) -> Result<Vec<u64>, ClientError> {
+        let listed: PtyListResult = self.call(method::PTY_LIST, &Empty {}).await?;
+        Ok(listed.pty_ids)
+    }
+
+    /// Reattaches to a terminal that is already running on the daemon.
+    ///
+    /// The counterpart to [`Self::spawn_terminal`], and the thing that makes
+    /// "background terminals keep working" usable rather than merely true.
+    ///
+    /// Without it, the daemon's PTYs survive a disconnect exactly as designed
+    /// (`ARCHITECTURE.md` §2) but the phone has no way back to them: after a
+    /// reconnect or an app restart every tab is frozen and the running build is
+    /// unreachable. That is the same failure mode as losing the work, from the
+    /// user's chair.
+    ///
+    /// Returns the current screen, so the caller can render immediately rather
+    /// than waiting a poll interval on a blank surface.
+    async fn attach_terminal(self: &Arc<Self>, pty_id: u64) -> Result<ScreenFrame, ClientError> {
+        // Fetch the screen first. If the terminal is gone the daemon answers
+        // NotFound and no poller is started, so a stale id from a previous
+        // session cannot leave a poller running against nothing.
+        let screen = self.screen(pty_id).await?;
+
+        let poller = tokio::spawn(poll_screen(Arc::downgrade(self), pty_id));
+        if let Some(previous) = lock(&self.terminals).insert(pty_id, poller) {
+            // Already attached — replace rather than run two pollers against one
+            // terminal, which would double the request rate for no benefit.
+            previous.abort();
+        }
+        Ok(screen)
+    }
+
     /// Kills a terminal and stops its poller.
     async fn close_terminal(&self, pty_id: u64) -> Result<(), ClientError> {
         if let Some(poller) = lock(&self.terminals).remove(&pty_id) {
@@ -1291,6 +1325,33 @@ impl GonomadClient {
     pub async fn screen(&self, pty_id: u64) -> Result<ScreenFrame, ClientError> {
         let inner = Arc::clone(&self.inner);
         self.run(async move { inner.screen(pty_id).await }).await
+    }
+
+    /// Lists the terminals still running on the daemon.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NotConnected`] when offline, or the daemon's error.
+    pub async fn list_terminals(&self) -> Result<Vec<u64>, ClientError> {
+        let inner = Arc::clone(&self.inner);
+        self.run(async move { inner.list_terminals().await }).await
+    }
+
+    /// Reattaches to a terminal already running on the daemon and returns its
+    /// current screen.
+    ///
+    /// Call this for each id from [`Self::list_terminals`] after connecting, so
+    /// that a reconnect or an app restart restores the user's terminals instead
+    /// of leaving them frozen. The daemon never stopped them.
+    ///
+    /// # Errors
+    ///
+    /// The daemon's `NotFound` if the terminal has since exited and been reaped;
+    /// no poller is started in that case.
+    pub async fn attach_terminal(&self, pty_id: u64) -> Result<ScreenFrame, ClientError> {
+        let inner = Arc::clone(&self.inner);
+        self.run(async move { inner.attach_terminal(pty_id).await })
+            .await
     }
 
     /// Terminates a terminal and stops its poller.

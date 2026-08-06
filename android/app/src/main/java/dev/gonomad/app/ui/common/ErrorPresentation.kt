@@ -1,14 +1,14 @@
 package dev.gonomad.app.ui.common
 
-import dev.gonomad.app.ffi.GonomadError
+import dev.gonomad.ffi.GonomadException
 
 /**
  * One rendering per member of the closed error enum.
  *
- * The contract makes errors a closed set precisely so the UI can offer a
- * *correct* action for each rather than a generic "something went wrong"
- * (docs/ffi-contract.md, design rule 3). Retrying a `Denied` is pointless and
- * teaches users to mash buttons; retrying a `Transport` is exactly right.
+ * The core makes errors a closed set precisely so the UI can offer a *correct*
+ * action for each rather than a generic "something went wrong" (§11.2). Retrying
+ * a `Denied` is pointless and teaches users to mash buttons; retrying a
+ * `Transport` is exactly right.
  */
 data class ErrorPresentation(
     val title: String,
@@ -19,70 +19,106 @@ data class ErrorPresentation(
 
 enum class ErrorAction { Retry, GoPair, None }
 
-fun Throwable.toPresentation(): ErrorPresentation = when (this) {
-    is GonomadError.Denied -> ErrorPresentation(
-        title = "Not permitted",
-        detail = "This device was not granted `$capability`. Grant it on the laptop " +
-            "under Devices, then try again. Secret paths also need a fresh biometric.",
-        actionLabel = null,
-        action = ErrorAction.None,
-    )
+/**
+ * Where the failure happened.
+ *
+ * Two variants read differently during pairing, and getting them wrong is not
+ * cosmetic. With `IKpsk2` the machine finishes its half of the handshake even
+ * when the pairing code was wrong, so a mistyped code surfaces on the phone as
+ * `Transport` — the authenticated `sys.register` never round-trips (§19 R24).
+ * Rendering that as "check your network" sends the user to reboot their router
+ * over a typo.
+ */
+enum class ErrorSite { General, Pairing }
 
-    is GonomadError.NotFound -> ErrorPresentation(
-        title = "No longer there",
-        detail = "The daemon could not find that path. It may have been moved or " +
-            "deleted since this listing was fetched.",
-        actionLabel = "Refresh",
-        action = ErrorAction.Retry,
-    )
+fun Throwable.toPresentation(site: ErrorSite = ErrorSite.General): ErrorPresentation =
+    when (this) {
+        // Subclasses of the generated sealed class are `class`, not `object`, so
+        // every branch here is an `is` check — `==` would never match.
+        is GonomadException.Denied -> ErrorPresentation(
+            title = "Not permitted",
+            detail = "This device does not hold `$capability`. Grant it on the machine " +
+                "under Devices, then try again. Secret paths need a fresh biometric too.",
+            actionLabel = null,
+            action = ErrorAction.None,
+        )
 
-    is GonomadError.RateLimited -> ErrorPresentation(
-        title = "Rate limited",
-        detail = "The daemon is throttling this device. Try again in about " +
-            "${(retryAfterMs.toLong() / 1000).coerceAtLeast(1)} s.",
-        actionLabel = "Try again",
-        action = ErrorAction.Retry,
-    )
+        is GonomadException.NotFound -> ErrorPresentation(
+            title = "No longer there",
+            detail = "Your machine has nothing at that path, or it sits outside the " +
+                "workspace roots. It may have moved since this listing was fetched.",
+            actionLabel = "Refresh",
+            action = ErrorAction.Retry,
+        )
 
-    is GonomadError.Unsupported -> ErrorPresentation(
-        title = "Can't open this",
-        detail = when (feature) {
-            "binary file" -> "This file is not UTF-8 text. The viewer refuses binary " +
-                "content rather than showing you mojibake."
-            "directory read" -> "That is a directory, not a file."
-            else -> "The daemon does not support `$feature` in this build."
-        },
-        actionLabel = null,
-        action = ErrorAction.None,
-    )
+        is GonomadException.RateLimited -> ErrorPresentation(
+            title = "Slow down",
+            detail = "Your machine is throttling this device. Try again in about " +
+                "${(retryAfterMs.toLong() / 1_000).coerceAtLeast(1)} s.",
+            actionLabel = "Try again",
+            action = ErrorAction.Retry,
+        )
 
-    is GonomadError.Transport -> ErrorPresentation(
-        title = "Can't reach the daemon",
-        detail = "$detail. Check the laptop is awake and on the same network — " +
-            "nothing is lost, the daemon keeps your terminals running.",
-        actionLabel = "Reconnect",
-        action = ErrorAction.Retry,
-    )
+        // Version skew, always: the FFI maps "daemon too old", "app too old", and
+        // an unknown method here. It is never a property of the file you opened.
+        is GonomadException.Unsupported -> ErrorPresentation(
+            title = "Versions don't match",
+            detail = "Your machine's GoNomad does not support `$feature`. Update the " +
+                "machine and the app to the same version — the protocol is negotiated " +
+                "once at connect, so a mismatch will not resolve itself.",
+            actionLabel = null,
+            action = ErrorAction.None,
+        )
 
-    is GonomadError.Protocol -> ErrorPresentation(
-        title = "Protocol error",
-        detail = "$detail. This usually means the app and the daemon are different " +
-            "versions.",
-        actionLabel = "Try again",
-        action = ErrorAction.Retry,
-    )
+        is GonomadException.Transport -> when (site) {
+            ErrorSite.Pairing -> ErrorPresentation(
+                title = "That code didn't match",
+                detail = "The handshake completed but your machine would not register this " +
+                    "device, which is what a wrong or expired pairing code looks like from " +
+                    "here. Run `gonomad pair` again and scan the new QR.",
+                actionLabel = "Try again",
+                action = ErrorAction.Retry,
+            )
 
-    is GonomadError.NotPaired -> ErrorPresentation(
-        title = "Not paired",
-        detail = "This phone is not paired with a machine yet.",
-        actionLabel = "Pair a machine",
-        action = ErrorAction.GoPair,
-    )
+            ErrorSite.General -> ErrorPresentation(
+                title = "Can't reach your machine",
+                detail = "$detail Nothing is lost — your terminals keep running there.",
+                actionLabel = "Reconnect",
+                action = ErrorAction.Retry,
+            )
+        }
 
-    else -> ErrorPresentation(
-        title = "Something went wrong",
-        detail = message ?: this::class.simpleName ?: "Unknown failure",
-        actionLabel = "Try again",
-        action = ErrorAction.Retry,
-    )
-}
+        is GonomadException.Protocol -> when (site) {
+            ErrorSite.Pairing -> ErrorPresentation(
+                title = "That isn't a GoNomad code",
+                detail = "$detail Run `gonomad pair` on the machine and scan the QR it " +
+                    "prints; the window is 120 seconds and single use.",
+                actionLabel = "Try again",
+                action = ErrorAction.Retry,
+            )
+
+            ErrorSite.General -> ErrorPresentation(
+                title = "Your machine refused that",
+                detail = detail,
+                actionLabel = "Try again",
+                action = ErrorAction.Retry,
+            )
+        }
+
+        is GonomadException.NotPaired -> ErrorPresentation(
+            title = "Not paired",
+            detail = "This phone is not paired with a machine yet, so there is nothing to " +
+                "connect to.",
+            actionLabel = "Pair a machine",
+            action = ErrorAction.GoPair,
+        )
+
+        // Not from the core: a cancelled coroutine, or a bug. Say so plainly
+        // rather than dressing it up as a protocol failure.
+        else -> ErrorPresentation(
+            title = "Something went wrong",
+            detail = message ?: this::class.simpleName ?: "Unknown failure",
+            actionLabel = "Try again",
+            action = ErrorAction.Retry,
+        )
+    }

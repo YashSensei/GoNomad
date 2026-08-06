@@ -36,8 +36,8 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.gonomad.app.ffi.FileContent
-import dev.gonomad.app.ffi.GonomadError
+import dev.gonomad.ffi.FileContent
+import dev.gonomad.ffi.GonomadException
 import dev.gonomad.app.ui.common.ErrorAction
 import dev.gonomad.app.ui.common.scopedViewModel
 import dev.gonomad.app.ui.common.toPresentation
@@ -306,7 +306,7 @@ private fun ViewerDeniedPreview() {
             state = ViewerUiState(
                 path = "C:/Users/dev/src/atlas-api/.env",
                 loading = false,
-                error = GonomadError.Denied("fs:secrets").toPresentation(),
+                error = GonomadException.Denied("fs:secrets").toPresentation(),
             ),
             onBack = {},
             onRetry = {},

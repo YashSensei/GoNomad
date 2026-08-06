@@ -1,7 +1,7 @@
 package dev.gonomad.app.ffi.fake
 
-import dev.gonomad.app.ffi.EntryKind
-import dev.gonomad.app.ffi.TerminalFrame
+import dev.gonomad.ffi.EntryKind
+import dev.gonomad.ffi.TerminalFrame
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -30,7 +30,8 @@ internal class FakeShell(
     private var historyCursor = -1
     private var cols = 80
 
-    fun banner() {
+    /** Returns the first frame, which `spawnTerminal` hands back with the id. */
+    fun banner(): TerminalFrame {
         emitLine("Windows PowerShell 7.4.5")
         emitLine("(c) Microsoft Corporation. All rights reserved.")
         emitLine("")
@@ -38,7 +39,7 @@ internal class FakeShell(
         emitLine("gonomad: scrollback lives on the daemon and survives disconnects")
         emitLine("Type 'help' for the commands this fake core understands.")
         emitLine("")
-        push()
+        return push()
     }
 
     fun resize(newCols: Int, @Suppress("UNUSED_PARAMETER") newRows: Int) {
@@ -278,17 +279,17 @@ internal class FakeShell(
         while (lines.size > SCROLLBACK) lines.removeFirst()
     }
 
-    private fun push() {
+    private fun push(): TerminalFrame {
         val current = prompt() + input.toString()
         val screen = (lines + current).joinToString("\n")
-        onFrame(
-            TerminalFrame(
-                ptyId = ptyId,
-                screen = screen,
-                cursorRow = lines.size.coerceAtMost(UShort.MAX_VALUE.toInt()).toUShort(),
-                cursorCol = current.length.coerceAtMost(UShort.MAX_VALUE.toInt()).toUShort(),
-            ),
+        val frame = TerminalFrame(
+            ptyId = ptyId,
+            screen = screen,
+            cursorRow = lines.size.coerceAtMost(UShort.MAX_VALUE.toInt()).toUShort(),
+            cursorCol = current.length.coerceAtMost(UShort.MAX_VALUE.toInt()).toUShort(),
         )
+        onFrame(frame)
+        return frame
     }
 
     private fun stamp(ms: Long = System.currentTimeMillis()): String =

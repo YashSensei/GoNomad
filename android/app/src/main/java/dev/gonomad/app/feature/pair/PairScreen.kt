@@ -99,6 +99,7 @@ fun PairScreen(onPaired: () -> Unit) {
         onQrScanned = vm::onQrScanned,
         onManualEntry = vm::startManualEntry,
         onManualCodeChanged = vm::onManualCodeChanged,
+        onDeviceNameChanged = vm::onDeviceNameChanged,
         onSubmitManual = vm::submitManualCode,
         onConfirmSas = vm::confirmSasMatches,
         onRejectSas = vm::rejectSas,
@@ -121,6 +122,7 @@ private fun PairContent(
     onQrScanned: (String) -> Unit,
     onManualEntry: () -> Unit,
     onManualCodeChanged: (String) -> Unit,
+    onDeviceNameChanged: (String) -> Unit,
     onSubmitManual: () -> Unit,
     onConfirmSas: () -> Unit,
     onRejectSas: () -> Unit,
@@ -132,6 +134,7 @@ private fun PairContent(
 
         is PairStep.ConfirmSas -> SasStep(
             sas = step.sas,
+            deviceName = state.deviceName,
             onConfirm = onConfirmSas,
             onReject = onRejectSas,
         )
@@ -162,6 +165,7 @@ private fun PairContent(
             state = state,
             onRequestScan = onRequestScan,
             onManualEntry = onManualEntry,
+            onDeviceNameChanged = onDeviceNameChanged,
             onOpenAppSettings = onOpenAppSettings,
         )
     }
@@ -174,6 +178,7 @@ private fun IntroStep(
     state: PairUiState,
     onRequestScan: () -> Unit,
     onManualEntry: () -> Unit,
+    onDeviceNameChanged: (String) -> Unit,
     onOpenAppSettings: () -> Unit,
 ) {
     Scaffold(containerColor = MaterialTheme.colorScheme.background) { inner ->
@@ -261,6 +266,36 @@ private fun IntroStep(
                 VSpace(Space.s)
                 Text(
                     text = "The QR is valid for 120 seconds and can be used once.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.semantic.textFaint,
+                )
+            }
+
+            VSpace(Space.m)
+
+            // Editable before scanning rather than on the SAS screen: that screen
+            // holds one security decision and nothing else belongs on it.
+            BlendedCard {
+                Text(
+                    text = "This phone's name",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                VSpace(Space.s)
+                OutlinedTextField(
+                    value = state.deviceName,
+                    onValueChange = onDeviceNameChanged,
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    textStyle = Mono.body,
+                    placeholder = { Text("Android phone", style = Mono.body) },
+                    shape = RoundedCornerShape(12.dp),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                )
+                VSpace(Space.s)
+                Text(
+                    text = "How this device appears in the machine's device list and audit " +
+                        "log — which is where you go to revoke it.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.semantic.textFaint,
                 )
@@ -442,7 +477,12 @@ private fun ScanningStep(onQrScanned: (String) -> Unit, onCancel: () -> Unit) {
  * "designed" here is the bug.
  */
 @Composable
-private fun SasStep(sas: String, onConfirm: () -> Unit, onReject: () -> Unit) {
+private fun SasStep(
+    sas: String,
+    deviceName: String,
+    onConfirm: () -> Unit,
+    onReject: () -> Unit,
+) {
     Scaffold(containerColor = MaterialTheme.colorScheme.background) { inner ->
         Column(
             modifier = Modifier
@@ -484,6 +524,13 @@ private fun SasStep(sas: String, onConfirm: () -> Unit, onReject: () -> Unit) {
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.semantic.textLow,
                 textAlign = TextAlign.Center,
+            )
+
+            VSpace(Space.m)
+
+            MonoText(
+                text = "registering as $deviceName",
+                color = MaterialTheme.semantic.textFaint,
             )
 
             VSpace(Space.xl)
@@ -650,11 +697,12 @@ private fun BusyStep(title: String, body: String) {
 private fun PairIntroPreview() {
     GoNomadTheme {
         PairContent(
-            state = PairUiState(),
+            state = PairUiState(deviceName = "Pixel 8 Pro"),
             onRequestScan = {},
             onQrScanned = {},
             onManualEntry = {},
             onManualCodeChanged = {},
+            onDeviceNameChanged = {},
             onSubmitManual = {},
             onConfirmSas = {},
             onRejectSas = {},
@@ -669,11 +717,15 @@ private fun PairIntroPreview() {
 private fun PairSasPreview() {
     GoNomadTheme {
         PairContent(
-            state = PairUiState(step = PairStep.ConfirmSas("418 273")),
+            state = PairUiState(
+                step = PairStep.ConfirmSas("418 273"),
+                deviceName = "Pixel 8 Pro",
+            ),
             onRequestScan = {},
             onQrScanned = {},
             onManualEntry = {},
             onManualCodeChanged = {},
+            onDeviceNameChanged = {},
             onSubmitManual = {},
             onConfirmSas = {},
             onRejectSas = {},
@@ -693,6 +745,7 @@ private fun PairManualPreview() {
             onQrScanned = {},
             onManualEntry = {},
             onManualCodeChanged = {},
+            onDeviceNameChanged = {},
             onSubmitManual = {},
             onConfirmSas = {},
             onRejectSas = {},

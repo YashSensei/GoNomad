@@ -30,8 +30,8 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import dev.gonomad.app.ffi.ConnState
-import dev.gonomad.app.ffi.Status
+import dev.gonomad.ffi.ConnState
+import dev.gonomad.ffi.Status
 import dev.gonomad.app.ui.theme.Space
 import dev.gonomad.app.ui.theme.semantic
 

@@ -1,15 +1,16 @@
 package dev.gonomad.app.ffi.fake
 
-import dev.gonomad.app.ffi.ConnState
-import dev.gonomad.app.ffi.DeviceInfo
-import dev.gonomad.app.ffi.DirEntry
-import dev.gonomad.app.ffi.EntryKind
-import dev.gonomad.app.ffi.FileContent
-import dev.gonomad.app.ffi.GonomadClient
-import dev.gonomad.app.ffi.GonomadError
-import dev.gonomad.app.ffi.Status
-import dev.gonomad.app.ffi.StatusListener
-import dev.gonomad.app.ffi.TerminalListener
+import dev.gonomad.ffi.ConnState
+import dev.gonomad.ffi.DeviceInfo
+import dev.gonomad.ffi.DirEntry
+import dev.gonomad.ffi.EntryKind
+import dev.gonomad.ffi.FileContent
+import dev.gonomad.ffi.GonomadClientInterface
+import dev.gonomad.ffi.GonomadException
+import dev.gonomad.ffi.Status
+import dev.gonomad.ffi.StatusListener
+import dev.gonomad.ffi.TerminalHandle
+import dev.gonomad.ffi.TerminalListener
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -23,14 +24,20 @@ import kotlin.math.abs
 import kotlin.random.Random
 
 /**
- * An in-process stand-in for `gonomad-ffi`, used while the Rust core is being
- * written. Selected by [dev.gonomad.app.ffi.ClientProvider.USE_FAKE].
+ * An in-process stand-in for the Rust core, selected by
+ * [dev.gonomad.app.ffi.ClientProvider.USE_FAKE] (which defaults to `false`).
  *
- * It is not a protocol simulator — it is a source of believable data with
- * believable latency, so every screen, empty state, and error path in the app
- * can be built and judged today. Everything it returns is invented.
+ * It implements the **generated** [GonomadClientInterface], not a hand-written
+ * copy of it, so the compiler now enforces that the fake and the real client are
+ * the same shape. When the Rust API changes, this file stops compiling — which is
+ * the entire point of the arrangement.
+ *
+ * It is not a protocol simulator. It is a source of believable data with
+ * believable latency so every screen, empty state, and error path can be judged
+ * in a `@Preview` or without a daemon on the network. Everything it returns is
+ * invented.
  */
-class FakeGonomadClient(private val stateDir: String) : GonomadClient {
+class FakeGonomadClient(private val stateDir: String) : GonomadClientInterface {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -42,7 +49,7 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClient {
     @Volatile
     private var pendingSas: String? = null
 
-    /** What this phone is called on the laptop's device list. */
+    /** What this phone is called on the machine's device list. */
     @Volatile
     private var registeredAs: String? = null
 
@@ -71,24 +78,27 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClient {
     override fun pairedDaemon(): DeviceInfo? = daemon
 
     override suspend fun beginPairing(qrPayload: String): String {
-        // A Noise handshake plus a round trip is not instant, and the UI needs
-        // a progress state that lasts long enough to read.
+        // A Noise handshake plus a round trip is not instant, and the UI needs a
+        // progress state that lasts long enough to read.
         delay(900)
 
         val payload = qrPayload.trim()
         if (payload.isEmpty()) {
-            throw GonomadError.Protocol("empty pairing payload")
+            throw GonomadException.Protocol("The pairing payload was empty.")
         }
-        // The real payload is `gonomad://pair?...`, and the real check is a
-        // Noise handshake, not a string match. The fake accepts anything long
-        // enough so that scanning whatever QR is to hand still demonstrates
-        // the flow; the two rejections below exist so the error paths are
-        // reachable without a daemon.
+        // The real payload is `gonomad://pair?...` and the real check is a Noise
+        // handshake, not a string match. The fake accepts anything long enough so
+        // that scanning whatever QR is to hand still demonstrates the flow; the
+        // rejections below exist so the error paths stay reachable with no daemon.
         if (payload.length < 8) {
-            throw GonomadError.Protocol("that code is too short to be a pairing payload")
+            throw GonomadException.Protocol("That is too short to be a pairing payload.")
         }
         if (payload.contains("expired")) {
-            throw GonomadError.Protocol("pairing window expired")
+            throw GonomadException.Protocol("That pairing window has expired.")
+        }
+        // A wrong code shows up as Transport, exactly as it does for real (§19 R24).
+        if (payload.contains("wrong")) {
+            throw GonomadException.Transport("The machine would not register this device.")
         }
 
         // A real SAS is derived from the handshake hash. This derives from the
@@ -100,12 +110,12 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClient {
     }
 
     /**
-     * [deviceName] is the name *this phone* registers under on the laptop's
-     * device list — it is not the daemon's name. `pairedDaemon()` returns the
-     * daemon, so the hostname the fake reports here is the laptop's.
+     * [deviceName] is the name *this phone* registers under on the machine's
+     * device list — it is not the machine's name. `pairedDaemon()` returns the
+     * machine, so the hostname reported here is the laptop's.
      */
     override suspend fun confirmPairing(deviceName: String) {
-        if (pendingSas == null) throw GonomadError.Protocol("no pairing in progress")
+        if (pendingSas == null) throw GonomadException.Protocol("No pairing is in progress.")
         delay(600)
         registeredAs = deviceName
         val info = DeviceInfo(
@@ -138,7 +148,7 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClient {
     // --- connection ----------------------------------------------------------
 
     override suspend fun connect() {
-        val info = daemon ?: throw GonomadError.NotPaired
+        val info = daemon ?: throw GonomadException.NotPaired()
         emit(
             current.copy(
                 state = ConnState.CONNECTING,
@@ -190,9 +200,11 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClient {
     }
 
     private fun requireConnected() {
-        if (daemon == null) throw GonomadError.NotPaired
+        if (daemon == null) throw GonomadException.NotPaired()
         if (current.state != ConnState.CONNECTED) {
-            throw GonomadError.Transport("no session with ${daemon?.name ?: "the daemon"}")
+            throw GonomadException.Transport(
+                "No session with ${daemon?.name ?: "your machine"}.",
+            )
         }
     }
 
@@ -207,7 +219,7 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClient {
     override suspend fun listDir(path: String): List<DirEntry> {
         requireConnected()
         delay(Random.nextLong(180, 420))
-        return FakeWorkspace.dirs[path.trimEnd('/')] ?: throw GonomadError.NotFound
+        return FakeWorkspace.dirs[path.trimEnd('/')] ?: throw GonomadException.NotFound()
     }
 
     override suspend fun readFile(path: String): FileContent {
@@ -217,16 +229,18 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClient {
         val key = path.trimEnd('/')
         if (key in FakeWorkspace.denylisted) {
             // The daemon refuses before reading a byte: this needs `fs:secrets`
-            // plus a live biometric (README, "How it's secured").
-            throw GonomadError.Denied("fs:secrets")
+            // plus a live biometric.
+            throw GonomadException.Denied("fs:secrets")
         }
         if (key in FakeWorkspace.binary) {
-            throw GonomadError.Unsupported("binary file")
+            // The real daemon reports a non-UTF-8 file as a bad request, which
+            // the FFI maps to Protocol — not Unsupported, which is version skew.
+            throw GonomadException.Protocol("That file is not valid UTF-8 text.")
         }
 
-        val entry = entryFor(key) ?: throw GonomadError.NotFound
+        val entry = entryFor(key) ?: throw GonomadException.NotFound()
         if (entry.kind == EntryKind.DIRECTORY) {
-            throw GonomadError.Unsupported("directory read")
+            throw GonomadException.Protocol("That is a directory, not a file.")
         }
 
         val text = FakeWorkspace.files[key]
@@ -247,7 +261,7 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClient {
 
     // --- terminal ------------------------------------------------------------
 
-    override suspend fun spawnTerminal(cwd: String?): ULong {
+    override suspend fun spawnTerminal(cwd: String?): TerminalHandle {
         requireConnected()
         delay(340)
         val id = nextPtyId.getAndIncrement().toULong()
@@ -259,24 +273,25 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClient {
             terminalListener?.onFrame(frame)
         }
         shells[id] = shell
-        shell.banner()
-        return id
+        // The contract returns the first frame with the id, so the caller never
+        // has to render a blank screen while waiting for a poll.
+        return TerminalHandle(ptyId = id, initial = shell.banner())
     }
 
     override suspend fun sendInput(ptyId: ULong, data: String) {
         requireConnected()
-        val shell = shells[ptyId] ?: throw GonomadError.NotFound
+        val shell = shells[ptyId] ?: throw GonomadException.NotFound()
         shell.feed(data)
     }
 
     override suspend fun resizeTerminal(ptyId: ULong, cols: UShort, rows: UShort) {
         requireConnected()
-        val shell = shells[ptyId] ?: throw GonomadError.NotFound
+        val shell = shells[ptyId] ?: throw GonomadException.NotFound()
         shell.resize(cols.toInt(), rows.toInt())
     }
 
     override suspend fun closeTerminal(ptyId: ULong) {
-        shells.remove(ptyId)
+        shells.remove(ptyId) ?: throw GonomadException.NotFound()
     }
 
     override fun observeTerminal(listener: TerminalListener) {
@@ -284,15 +299,15 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClient {
     }
 
     // --- pairing persistence -------------------------------------------------
-    // The real client keeps this in the Keystore-backed store. A tiny file is
+    // The real client keeps this in its own state directory. A tiny file is
     // enough for the fake to survive a cold start, which matters because
     // re-pairing on every launch would hide every other screen.
 
     private fun readPairing(): DeviceInfo? = runCatching {
         val f = File(stateDir, PAIRING_FILE)
         if (!f.exists()) return@runCatching null
-        // One field per line: no delimiter to escape, and trivially readable
-        // with `adb shell run-as` while debugging.
+        // One field per line: no delimiter to escape, and trivially readable with
+        // `adb shell run-as` while debugging.
         val parts = f.readLines()
         if (parts.size < 3) return@runCatching null
         DeviceInfo(

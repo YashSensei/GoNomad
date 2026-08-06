@@ -1,7 +1,7 @@
 package dev.gonomad.app.ffi.fake
 
-import dev.gonomad.app.ffi.DirEntry
-import dev.gonomad.app.ffi.EntryKind
+import dev.gonomad.ffi.DirEntry
+import dev.gonomad.ffi.EntryKind
 
 /**
  * Canned filesystem for [FakeGonomadClient].
@@ -11,9 +11,13 @@ import dev.gonomad.app.ffi.EntryKind
  * use forward slashes even though the daemon is Windows-first, matching how
  * the protocol normalises them.
  *
- * Deliberately includes the awkward cases the UI must handle: hidden files,
- * gitignored directories, a denylisted `.env`, a binary file, and a file large
- * enough to come back truncated.
+ * Deliberately includes the awkward cases the UI must handle: hidden files, a
+ * denylisted `.env`, a binary file, and a file large enough to come back
+ * truncated.
+ *
+ * `isGitIgnored` is `false` on every entry, matching the real `fs.list`, which
+ * does not carry the flag until M3. The fake reports what the daemon reports;
+ * inventing ignore data here would let a UI that dims tracked files pass review.
  */
 internal object FakeWorkspace {
 
@@ -33,14 +37,13 @@ internal object FakeWorkspace {
         name: String,
         modifiedAgo: Long = 2 * HOUR,
         hidden: Boolean = name.startsWith("."),
-        ignored: Boolean = false,
     ) = DirEntry(
         name = name,
         kind = EntryKind.DIRECTORY,
         sizeBytes = null,
         modifiedMs = now - modifiedAgo,
         isHidden = hidden,
-        isGitIgnored = ignored,
+        isGitIgnored = false,
     )
 
     private fun file(
@@ -48,14 +51,13 @@ internal object FakeWorkspace {
         size: Long,
         modifiedAgo: Long = 3 * HOUR,
         hidden: Boolean = name.startsWith("."),
-        ignored: Boolean = false,
     ) = DirEntry(
         name = name,
         kind = EntryKind.FILE,
         sizeBytes = size.toULong(),
         modifiedMs = now - modifiedAgo,
         isHidden = hidden,
-        isGitIgnored = ignored,
+        isGitIgnored = false,
     )
 
     private fun link(name: String) = DirEntry(
@@ -74,10 +76,10 @@ internal object FakeWorkspace {
             dir("android", modifiedAgo = 11 * MINUTE),
             dir("crates", modifiedAgo = 48 * MINUTE),
             dir("docs", modifiedAgo = 2 * HOUR),
-            dir("target", modifiedAgo = 9 * MINUTE, ignored = true),
+            dir("target", modifiedAgo = 9 * MINUTE),
             file(".gitignore", 612, 5 * DAY),
             file("ARCHITECTURE.md", 148_390, 3 * HOUR),
-            file("Cargo.lock", 91_244, 47 * MINUTE, ignored = false),
+            file("Cargo.lock", 91_244, 47 * MINUTE),
             file("Cargo.toml", 1_486, 47 * MINUTE),
             file("LICENSE", 11_357, 21 * DAY),
             file("README.md", 24_812, 4 * HOUR),
@@ -98,7 +100,7 @@ internal object FakeWorkspace {
             file("settings.gradle.kts", 532, 40 * MINUTE),
         ),
         "$ROOT_GONOMAD/android/app" to listOf(
-            dir("build", modifiedAgo = 4 * MINUTE, ignored = true),
+            dir("build", modifiedAgo = 4 * MINUTE),
             dir("src", modifiedAgo = 11 * MINUTE),
             file("build.gradle.kts", 2_744, 33 * MINUTE),
         ),
@@ -125,7 +127,8 @@ internal object FakeWorkspace {
             file("MainActivity.kt", 1_940, 11 * MINUTE),
         ),
         "$ROOT_GONOMAD/android/app/src/main/java/dev/gonomad/app/ffi" to listOf(
-            file("GonomadClient.kt", 4_112, 11 * MINUTE),
+            file("ClientProvider.kt", 2_640, 11 * MINUTE),
+            file("TerminalsRepository.kt", 7_318, 11 * MINUTE),
         ),
         "$ROOT_GONOMAD/android/app/src/main/java/dev/gonomad/app/ui" to listOf(
             dir("theme", modifiedAgo = 14 * MINUTE),
@@ -208,20 +211,20 @@ internal object FakeWorkspace {
             file("threat-model.md", 18_441, 4 * DAY),
         ),
         "$ROOT_GONOMAD/target" to listOf(
-            dir("debug", modifiedAgo = 9 * MINUTE, ignored = true),
-            dir("release", modifiedAgo = 3 * DAY, ignored = true),
-            file(".rustc_info.json", 1_804, 9 * MINUTE, ignored = true),
+            dir("debug", modifiedAgo = 9 * MINUTE),
+            dir("release", modifiedAgo = 3 * DAY),
+            file(".rustc_info.json", 1_804, 9 * MINUTE),
         ),
         "$ROOT_GONOMAD/target/debug" to listOf(
-            dir("deps", modifiedAgo = 9 * MINUTE, ignored = true),
-            file("gonomad.exe", 41_882_112, 9 * MINUTE, ignored = true),
+            dir("deps", modifiedAgo = 9 * MINUTE),
+            file("gonomad.exe", 41_882_112, 9 * MINUTE),
         ),
         "$ROOT_GONOMAD/target/release" to emptyList(),
         "$ROOT_GONOMAD/target/debug/deps" to emptyList(),
 
         ROOT_ATLAS to listOf(
             dir(".vscode", modifiedAgo = 12 * DAY),
-            dir("node_modules", modifiedAgo = 2 * DAY, ignored = true),
+            dir("node_modules", modifiedAgo = 2 * DAY),
             dir("src", modifiedAgo = 22 * MINUTE),
             dir("tests", modifiedAgo = 5 * HOUR),
             file(".env", 341, 8 * DAY),

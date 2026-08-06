@@ -2,7 +2,7 @@ package dev.gonomad.app.feature.viewer
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import dev.gonomad.app.ffi.FileContent
+import dev.gonomad.ffi.FileContent
 import dev.gonomad.app.ffi.SessionRepository
 import dev.gonomad.app.ui.common.ErrorPresentation
 import dev.gonomad.app.ui.common.toPresentation

@@ -39,9 +39,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.gonomad.app.ffi.ConnState
-import dev.gonomad.app.ffi.DeviceInfo
-import dev.gonomad.app.ffi.Status
+import dev.gonomad.ffi.ConnState
+import dev.gonomad.ffi.DeviceInfo
+import dev.gonomad.ffi.Status
 import dev.gonomad.app.ui.common.ErrorAction
 import dev.gonomad.app.ui.common.relativeTime
 import dev.gonomad.app.ui.common.scopedViewModel

@@ -2,10 +2,10 @@ package dev.gonomad.app.feature.home
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import dev.gonomad.app.ffi.ConnState
-import dev.gonomad.app.ffi.DeviceInfo
+import dev.gonomad.ffi.ConnState
+import dev.gonomad.ffi.DeviceInfo
 import dev.gonomad.app.ffi.SessionRepository
-import dev.gonomad.app.ffi.Status
+import dev.gonomad.ffi.Status
 import dev.gonomad.app.ui.common.ErrorPresentation
 import dev.gonomad.app.ui.common.toPresentation
 import kotlinx.coroutines.flow.MutableStateFlow

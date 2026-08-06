@@ -2,8 +2,8 @@ package dev.gonomad.app.feature.files
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import dev.gonomad.app.ffi.DirEntry
-import dev.gonomad.app.ffi.EntryKind
+import dev.gonomad.ffi.DirEntry
+import dev.gonomad.ffi.EntryKind
 import dev.gonomad.app.ffi.SessionRepository
 import dev.gonomad.app.ui.common.ErrorPresentation
 import dev.gonomad.app.ui.common.toPresentation
@@ -29,7 +29,6 @@ data class FilesUiState(
     val nodes: List<FileNode> = emptyList(),
     val error: ErrorPresentation? = null,
     val showHidden: Boolean = false,
-    val showIgnored: Boolean = false,
 ) {
     val isEmpty: Boolean get() = !loading && error == null && nodes.isEmpty()
 }
@@ -68,11 +67,6 @@ class FilesViewModel(
 
     fun toggleHidden() {
         _state.update { it.copy(showHidden = !it.showHidden) }
-        rebuild()
-    }
-
-    fun toggleIgnored() {
-        _state.update { it.copy(showIgnored = !it.showIgnored) }
         rebuild()
     }
 
@@ -142,16 +136,19 @@ class FilesViewModel(
         }
     }
 
+    /**
+     * `DirEntry.isGitIgnored` is deliberately not consulted: `fs.list` does not
+     * carry the flag in this slice and always reports `false`, so filtering on it
+     * would be a no-op control that looks like it works.
+     */
     private fun rebuild() {
         val showHidden = _state.value.showHidden
-        val showIgnored = _state.value.showIgnored
         val out = mutableListOf<FileNode>()
 
         fun walk(dir: String, depth: Int) {
             val entries = children[dir] ?: return
             for (entry in entries) {
                 if (entry.isHidden && !showHidden) continue
-                if (entry.isGitIgnored && !showIgnored) continue
                 val path = "$dir/${entry.name}"
                 val isOpen = path in expanded
                 out += FileNode(

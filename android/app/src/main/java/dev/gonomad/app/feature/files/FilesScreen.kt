@@ -45,12 +45,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.gonomad.app.ffi.DirEntry
-import dev.gonomad.app.ffi.EntryKind
+import dev.gonomad.ffi.DirEntry
+import dev.gonomad.ffi.EntryKind
+import dev.gonomad.ffi.GonomadException
 import dev.gonomad.app.ui.common.ErrorAction
 import dev.gonomad.app.ui.common.formatBytes
 import dev.gonomad.app.ui.common.relativeTime
 import dev.gonomad.app.ui.common.scopedViewModel
+import dev.gonomad.app.ui.common.toPresentation
 import dev.gonomad.app.ui.components.EmptyState
 import dev.gonomad.app.ui.components.ErrorState
 import dev.gonomad.app.ui.components.FileListSkeleton
@@ -79,7 +81,6 @@ fun FilesScreen(
         onRefresh = vm::refresh,
         onRetry = vm::retry,
         onToggleHidden = vm::toggleHidden,
-        onToggleIgnored = vm::toggleIgnored,
         onNodeClick = { node -> vm.onNodeClicked(node, onOpenFile) },
         onOpenTerminal = { onOpenTerminal(root) },
     )
@@ -93,7 +94,6 @@ private fun FilesContent(
     onRefresh: () -> Unit,
     onRetry: () -> Unit,
     onToggleHidden: () -> Unit,
-    onToggleIgnored: () -> Unit,
     onNodeClick: (FileNode) -> Unit,
     onOpenTerminal: () -> Unit,
 ) {
@@ -122,20 +122,14 @@ private fun FilesContent(
                         color = MaterialTheme.colorScheme.onBackground,
                         modifier = Modifier.weight(1f),
                     )
+                    // Only one filter: `fs.list` reports no ignore information in
+                    // this slice, so a gitignore toggle would do nothing.
                     FilterToggle(
                         on = state.showHidden,
                         onLabel = "Hiding dotfiles",
                         offLabel = "Showing dotfiles",
                         text = "·hidden",
                         onClick = onToggleHidden,
-                    )
-                    HSpace(Space.xs)
-                    FilterToggle(
-                        on = state.showIgnored,
-                        onLabel = "Hiding gitignored files",
-                        offLabel = "Showing gitignored files",
-                        text = "ignored",
-                        onClick = onToggleIgnored,
                     )
                     IconButton(onClick = onOpenTerminal, modifier = Modifier.size(48.dp)) {
                         Icon(
@@ -172,8 +166,8 @@ private fun FilesContent(
                 state.isEmpty -> EmptyState(
                     icon = Icons.Rounded.FolderOff,
                     title = "Nothing visible here",
-                    body = "This directory is empty, or everything in it is hidden or " +
-                        "gitignored. Try the toggles above.",
+                    body = "This directory is empty, or everything in it is a dotfile. " +
+                        "Try the ·hidden toggle above.",
                 )
 
                 else -> PullToRefreshBox(
@@ -269,7 +263,7 @@ private fun Breadcrumb(root: String) {
 private fun FileRow(node: FileNode, onClick: () -> Unit) {
     val entry = node.entry
     val glyph = glyphFor(entry, node.expanded)
-    val dimmed = entry.isGitIgnored || entry.isHidden
+    val dimmed = entry.isHidden
 
     val nameColour = when {
         dimmed -> MaterialTheme.semantic.textFaint
@@ -353,7 +347,6 @@ private fun FileRow(node: FileNode, onClick: () -> Unit) {
             val meta = buildList {
                 if (entry.kind == EntryKind.FILE) add(formatBytes(entry.sizeBytes))
                 entry.modifiedMs?.let { add(relativeTime(it)) }
-                if (entry.isGitIgnored) add("gitignored")
             }.filter { it.isNotBlank() }
             if (meta.isNotEmpty()) {
                 Text(
@@ -369,18 +362,18 @@ private fun FileRow(node: FileNode, onClick: () -> Unit) {
 
 // --- previews ---------------------------------------------------------------
 
+// `isGitIgnored` is false everywhere here, exactly as the daemon reports it.
 private fun previewEntry(
     name: String,
     kind: EntryKind = EntryKind.FILE,
     size: Long? = 1_204,
-    ignored: Boolean = false,
 ) = DirEntry(
     name = name,
     kind = kind,
     sizeBytes = size?.toULong(),
     modifiedMs = System.currentTimeMillis() - 47 * 60_000L,
     isHidden = name.startsWith("."),
-    isGitIgnored = ignored,
+    isGitIgnored = false,
 )
 
 private val previewNodes = listOf(
@@ -394,7 +387,7 @@ private val previewNodes = listOf(
     ),
     FileNode("/r/crates/gonomad-core/src", previewEntry("src", EntryKind.DIRECTORY, null), 2, false, true),
     FileNode("/r/crates/gonomad-core/Cargo.toml", previewEntry("Cargo.toml", size = 742), 2, false, false),
-    FileNode("/r/target", previewEntry("target", EntryKind.DIRECTORY, null, ignored = true), 0, false, false),
+    FileNode("/r/target", previewEntry("target", EntryKind.DIRECTORY, null), 0, false, false),
     FileNode("/r/Cargo.toml", previewEntry("Cargo.toml", size = 1_486), 0, false, false),
     FileNode("/r/README.md", previewEntry("README.md", size = 24_812), 0, false, false),
     FileNode("/r/logo.png", previewEntry("logo.png", size = 38_402), 0, false, false),
@@ -409,13 +402,11 @@ private fun FilesPreview() {
                 root = "C:/Users/dev/src/gonomad",
                 loading = false,
                 nodes = previewNodes,
-                showIgnored = true,
             ),
             onBack = {},
             onRefresh = {},
             onRetry = {},
             onToggleHidden = {},
-            onToggleIgnored = {},
             onNodeClick = {},
             onOpenTerminal = {},
         )
@@ -432,7 +423,26 @@ private fun FilesLoadingPreview() {
             onRefresh = {},
             onRetry = {},
             onToggleHidden = {},
-            onToggleIgnored = {},
+            onNodeClick = {},
+            onOpenTerminal = {},
+        )
+    }
+}
+
+@Preview(name = "Files · denied", showBackground = true, backgroundColor = 0xFF0E1116)
+@Composable
+private fun FilesDeniedPreview() {
+    GoNomadTheme {
+        FilesContent(
+            state = FilesUiState(
+                root = "C:/Users/dev/src/atlas-api",
+                loading = false,
+                error = GonomadException.Denied("fs:read").toPresentation(),
+            ),
+            onBack = {},
+            onRefresh = {},
+            onRetry = {},
+            onToggleHidden = {},
             onNodeClick = {},
             onOpenTerminal = {},
         )

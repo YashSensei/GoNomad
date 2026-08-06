@@ -16,8 +16,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import dev.gonomad.app.ffi.DirEntry
-import dev.gonomad.app.ffi.EntryKind
+import dev.gonomad.ffi.DirEntry
+import dev.gonomad.ffi.EntryKind
 import dev.gonomad.app.ui.theme.semantic
 
 /** Icon plus tint plus the word a screen reader should hear. */

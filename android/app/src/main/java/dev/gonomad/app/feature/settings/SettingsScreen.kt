@@ -35,10 +35,11 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.gonomad.app.BuildConstants
-import dev.gonomad.app.ffi.ConnState
-import dev.gonomad.app.ffi.DeviceInfo
-import dev.gonomad.app.ffi.Status
+import dev.gonomad.ffi.ConnState
+import dev.gonomad.ffi.DeviceInfo
+import dev.gonomad.ffi.Status
 import dev.gonomad.app.ui.common.relativeTime
+import dev.gonomad.app.ui.common.rememberTerminals
 import dev.gonomad.app.ui.common.scopedViewModel
 import dev.gonomad.app.ui.components.BlendedCard
 import dev.gonomad.app.ui.components.ConnectionChip
@@ -52,7 +53,8 @@ import dev.gonomad.app.ui.theme.semantic
 
 @Composable
 fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
-    val vm: SettingsViewModel = scopedViewModel { SettingsViewModel(it) }
+    val terminals = rememberTerminals()
+    val vm: SettingsViewModel = scopedViewModel { SettingsViewModel(it, terminals) }
     val state by vm.state.collectAsStateWithLifecycle()
 
     LaunchedEffect(state.unpaired) {

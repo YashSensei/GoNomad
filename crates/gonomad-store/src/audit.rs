@@ -207,8 +207,14 @@ impl AuditEntry {
     /// The exact bytes that are hashed.
     ///
     /// Excludes `hash` itself (which would be circular) and includes every
-    /// other field plus a domain separator. Deterministic by construction —
-    /// see [`crate::canonical`] for why the encoder is hand-written.
+    /// other field plus a domain separator.
+    ///
+    /// Deterministic by construction: the encoder is hand-written rather than
+    /// derived through serde, because a derive would make the hash input a
+    /// function of struct field declaration order — so reordering two fields,
+    /// which no reviewer would flag, would silently invalidate every historical
+    /// entry. Output is RFC 8949 core-deterministic: definite lengths,
+    /// shortest-form integers, keys sorted by encoded bytes, no floats, no tags.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let device = self.device_id.map(DeviceId::to_bytes);
         canonical::map(&[

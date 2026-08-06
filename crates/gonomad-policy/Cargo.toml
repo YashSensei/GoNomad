@@ -14,7 +14,8 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 globset = { workspace = true }
-camino = { workspace = true }
+# Windows canonicalisation without the \\?\ verbatim prefix, which the path
+# guard must reject on input but must not produce itself.
 dunce = { workspace = true }
 
 [dev-dependencies]

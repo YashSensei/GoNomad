@@ -98,7 +98,9 @@ The security foundation is built first because retrofitting it is not possible.
 - [ ] Hybrid highlighting — CM6 client-side < 200 KB, tree-sitter server-side above
 - [ ] OneDrive/synced-folder detection + warning (`ARCHITECTURE.md` §24.13)
 
-**Exit:** open a 5 MB file without jank · edit and save via CAS · a concurrent external edit yields a *conflict*, never a clobber · search a 500k-file repo with first results < 500 ms · **a `cargo build` produces zero protocol frames from `target/`**
+- [ ] **Close the hard-link escape** (`ARCHITECTURE.md` §19 R19) — compare the opened handle's volume + file index against the roots' volumes, and supply `FileIdentity` to `ResolvedPath::confirm_identity` so the TOCTOU window (R21) actually closes
+
+**Exit:** open a 5 MB file without jank · edit and save via CAS · a concurrent external edit yields a *conflict*, never a clobber · search a 500k-file repo with first results < 500 ms · **a `cargo build` produces zero protocol frames from `target/`** · **a hard link to `~/.ssh/id_rsa` inside a workspace root is refused**
 
 ### M4 — Git · ~2–3 weeks
 

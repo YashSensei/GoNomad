@@ -10,6 +10,8 @@ serialization = "1.7.3"
 coroutines = "1.9.0"
 camerax = "1.3.4"
 mlkitBarcode = "17.3.0"
+# UniFFI's Kotlin backend calls the Rust .so through JNA.
+jna = "5.14.0"
 accompanistPermissions = "0.36.0"
 
 [libraries]
@@ -36,6 +38,10 @@ androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", 
 androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "camerax" }
 androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "camerax" }
 mlkit-barcode-scanning = { group = "com.google.mlkit", name = "barcode-scanning", version.ref = "mlkitBarcode" }
+# The @aar variant, not the plain jar: it ships JNA's own native libraries for
+# Android ABIs. The jar builds fine and then fails at runtime with
+# UnsatisfiedLinkError, which is a confusing way to discover this.
+jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

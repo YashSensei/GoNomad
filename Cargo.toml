@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/gonomad-proto",
+    "crates/gonomad-core",
     "crates/gonomad-store",
     "crates/gonomad-policy",
 ]
@@ -26,6 +27,7 @@ authors = ["The GoNomad Contributors"]
 [workspace.dependencies]
 # --- Internal ---
 gonomad-proto = { path = "crates/gonomad-proto", version = "0.0.1" }
+gonomad-core = { path = "crates/gonomad-core", version = "0.0.1" }
 gonomad-store = { path = "crates/gonomad-store", version = "0.0.1" }
 gonomad-policy = { path = "crates/gonomad-policy", version = "0.0.1" }
 
@@ -40,11 +42,17 @@ anyhow = "1.0"
 
 # --- Crypto (ARCHITECTURE.md §3) ---
 blake3 = "1.5"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core", "zeroize"] }
 rand = "0.8"
 rand_core = { version = "0.6", features = ["getrandom"] }
 subtle = "2.6"
 zeroize = { version = "1.8", features = ["derive"] }
+# Noise IK session layer. Layered inside QUIC deliberately, so that security is
+# independent of transport and adding a tunnel fallback cannot weaken it (§3.4).
+snow = "0.9"
+# Crockford base32 for the manual pairing code: no ambiguous 0/O or 1/I/l, which
+# matters when a human is reading digits off a laptop screen (§9.3).
+data-encoding = "2.6"
 
 # --- Storage (ARCHITECTURE.md §16.1: bundled SQLite, no system dep) ---
 rusqlite = { version = "0.32", features = ["bundled", "blob"] }

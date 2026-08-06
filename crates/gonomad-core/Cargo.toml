@@ -1,0 +1,38 @@
+[package]
+name = "gonomad-core"
+description = "GoNomad session core: device identity, Noise IK handshake, and pairing. Shared by the daemon and the mobile client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+gonomad-proto = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+snow = { workspace = true }
+data-encoding = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rand = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"

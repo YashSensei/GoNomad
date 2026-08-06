@@ -64,7 +64,9 @@ The security foundation is built first because retrofitting it is not possible.
 - [ ] Recovery phrase at `init` (24 words, shown once)
 - [ ] Property tests: adversarial paths (`..`, symlinks, UNC, 8.3, ADS, null bytes, unicode) never escape a root
 
-**Exit:** pair a phone over LTE · `sys.info` round-trips · an unpaired key is rejected pre-handshake · revocation effective on the next packet · `gonomad audit verify` passes · **an external port scan of the host finds nothing**
+- [ ] **Register a device only after an authenticated application exchange**, never on handshake completion (`ARCHITECTURE.md` §19 R24) — with `IKpsk2` the daemon completes its side even when the phone's PSK is wrong
+
+**Exit:** pair a phone over LTE · `sys.info` round-trips · an unpaired key is rejected pre-handshake · revocation effective on the next packet · `gonomad audit verify` passes · **an external port scan of the host finds nothing** · **a wrong pairing code registers nothing on the daemon**
 
 ### M2 — Terminal · ~3–4 weeks
 

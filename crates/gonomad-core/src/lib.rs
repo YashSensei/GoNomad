@@ -39,6 +39,7 @@
 pub mod identity;
 pub mod pairing;
 pub mod sas;
+pub mod session;
 
 pub use identity::{DeviceIdentity, IdentityError, SEED_LEN, SIGNATURE_LEN};
 pub use pairing::{
@@ -46,3 +47,7 @@ pub use pairing::{
     PAIRING_WINDOW_MS,
 };
 pub use sas::{Sas, SAS_DIGITS};
+pub use session::{
+    Handshake, Purpose, Session, SessionError, MAX_PLAINTEXT_LEN, NOISE_PARAMS,
+    NOISE_PARAMS_PAIRING,
+};

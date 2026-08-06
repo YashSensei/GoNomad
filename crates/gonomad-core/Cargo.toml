@@ -14,6 +14,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }

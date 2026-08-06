@@ -43,6 +43,11 @@ anyhow = "1.0"
 # --- Crypto (ARCHITECTURE.md §3) ---
 blake3 = "1.5"
 ed25519-dalek = { version = "2.1", features = ["rand_core", "zeroize"] }
+# X25519 for the Noise static key. Separate from the Ed25519 signing key: an
+# Ed25519 public key is NOT a valid X25519 public key even when both derive from
+# the same seed, so the two are distinct domain-separated subkeys (see
+# gonomad-core::identity).
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
 rand = "0.8"
 rand_core = { version = "0.6", features = ["getrandom"] }
 subtle = "2.6"

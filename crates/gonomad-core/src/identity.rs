@@ -1,9 +1,31 @@
-//! Device identity: the Ed25519 keypair that *is* the credential.
+//! Device identity: the keypairs that *are* the credential.
 //!
 //! GoNomad has no passwords, no bearer tokens, and no session cookies. A
-//! device's public key, registered at pairing, is the entirety of "may this
+//! device's public keys, registered at pairing, are the entirety of "may this
 //! device connect" (`ARCHITECTURE.md` §3.2). Every connection performs a fresh
-//! mutual authentication from this keypair.
+//! mutual authentication from them.
+//!
+//! # One seed, two subkeys
+//!
+//! A device has a single 32-byte master seed — one thing to store, back up, and
+//! revoke — from which two independent keypairs are derived with BLAKE3's
+//! key-derivation mode under distinct contexts:
+//!
+//! | Subkey | Algorithm | Used for |
+//! |---|---|---|
+//! | [`DeviceIdentity::public_key`] | Ed25519 | Detached signatures: presence approvals, audit records |
+//! | [`DeviceIdentity::noise_public_key`] | X25519 | The Noise static key for the session layer |
+//!
+//! **These are not interchangeable**, and the distinction is not a stylistic
+//! one: an Ed25519 public key is not a valid X25519 public key even when both
+//! derive from the same bytes, because the two algorithms use different curve
+//! encodings and scalar-clamping rules. Handing a peer an Ed25519 key as a Noise
+//! static simply fails to authenticate. Deriving two subkeys also avoids reusing
+//! one scalar across a signature scheme and a Diffie-Hellman scheme, which is a
+//! construction to stay away from regardless of whether a concrete attack is
+//! known.
+//!
+//! Both public keys are registered at pairing.
 //!
 //! That design dissolves several problem classes rather than solving them:
 //! there is no token to steal, nothing to rotate on a schedule, no replay of a
@@ -37,6 +59,7 @@ use core::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use gonomad_proto::{DeviceId, PublicKey};
+use x25519_dalek::StaticSecret;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Length of an Ed25519 private seed, in bytes.
@@ -52,6 +75,12 @@ pub const SIGNATURE_LEN: usize = 64;
 /// over a pairing transcript could potentially be presented as a signature
 /// authorising a destructive operation — the classic cross-protocol attack.
 const SIGN_DOMAIN: &[u8] = b"gonomad-device-signature-v1\x00";
+
+/// BLAKE3 key-derivation context for the Ed25519 signing subkey.
+const ED25519_SUBKEY_CONTEXT: &str = "gonomad 2026 device identity ed25519 v1";
+
+/// BLAKE3 key-derivation context for the X25519 Noise static subkey.
+const X25519_SUBKEY_CONTEXT: &str = "gonomad 2026 device identity x25519 v1";
 
 /// Errors from identity operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -81,7 +110,10 @@ pub enum IdentityError {
 /// [`DeviceIdentity::expose_seed`], never something that happens incidentally
 /// because a struct derived `Clone` and ended up in a log or a cache.
 pub struct DeviceIdentity {
+    /// Ed25519, for detached signatures: presence approvals and audit records.
     signing: SigningKey,
+    /// X25519, used as the Noise static key for the session layer.
+    noise_secret: StaticSecret,
     /// Retained so the seed can be re-exported for keyring storage without
     /// reconstructing it, and so it is wiped on drop.
     seed: Zeroizing<[u8; SEED_LEN]>,
@@ -112,8 +144,31 @@ impl DeviceIdentity {
     }
 
     fn from_seed_inner(seed: Zeroizing<[u8; SEED_LEN]>) -> Self {
-        let signing = SigningKey::from_bytes(&seed);
-        Self { signing, seed }
+        // Two distinct subkeys from one master seed, not one key used twice.
+        //
+        // This matters because an Ed25519 public key is NOT a valid X25519
+        // public key, even when both are derived from the same 32 bytes: the two
+        // algorithms use different curve encodings and different scalar-clamping
+        // rules. Handing a peer an Ed25519 key as a Noise static would simply
+        // fail to authenticate, and quietly reusing one scalar across a signature
+        // scheme and a Diffie-Hellman scheme is a construction cryptographers
+        // rightly object to.
+        //
+        // BLAKE3's key-derivation mode with distinct contexts gives two
+        // independent keys, so a compromise of one does not reveal the other, and
+        // the user still has exactly one secret to store, back up, and revoke.
+        let signing_seed =
+            Zeroizing::new(blake3::derive_key(ED25519_SUBKEY_CONTEXT, seed.as_ref()));
+        let signing = SigningKey::from_bytes(&signing_seed);
+
+        let noise_seed = Zeroizing::new(blake3::derive_key(X25519_SUBKEY_CONTEXT, seed.as_ref()));
+        let noise_secret = StaticSecret::from(*noise_seed);
+
+        Self {
+            signing,
+            noise_secret,
+            seed,
+        }
     }
 
     /// This device's public key — its credential.
@@ -126,6 +181,30 @@ impl DeviceIdentity {
     #[must_use]
     pub fn device_id(&self) -> DeviceId {
         DeviceId::from_public_key(&self.public_key())
+    }
+
+    /// This device's X25519 static public key, used by the Noise handshake.
+    ///
+    /// Distinct from [`DeviceIdentity::public_key`] and **not** interchangeable
+    /// with it: an Ed25519 public key is not a valid X25519 public key. This is
+    /// the value that goes in the pairing QR as the daemon's Noise static key,
+    /// and the value a peer must be dialled with.
+    ///
+    /// Both keys are registered at pairing: this one authenticates the transport,
+    /// and [`DeviceIdentity::public_key`] verifies detached signatures such as
+    /// presence approvals.
+    #[must_use]
+    pub fn noise_public_key(&self) -> PublicKey {
+        PublicKey::from_bytes(x25519_dalek::PublicKey::from(&self.noise_secret).to_bytes())
+    }
+
+    /// Exposes the X25519 static secret for the Noise handshake.
+    ///
+    /// Named conspicuously, like [`DeviceIdentity::expose_seed`]. The returned
+    /// buffer wipes itself on drop.
+    #[must_use]
+    pub fn expose_noise_secret(&self) -> Zeroizing<[u8; SEED_LEN]> {
+        Zeroizing::new(self.noise_secret.to_bytes())
     }
 
     /// Exposes the private seed for storage in a platform keyring.
@@ -228,6 +307,48 @@ mod tests {
     fn device_id_is_derived_from_the_public_key() {
         let id = DeviceIdentity::generate();
         assert_eq!(id.device_id(), DeviceId::from_public_key(&id.public_key()));
+    }
+
+    #[test]
+    fn the_signing_and_noise_keys_are_different() {
+        // Regression test for a real bug: the session layer was originally given
+        // the Ed25519 public key as the Noise remote static, and every handshake
+        // failed. An Ed25519 public key is not a valid X25519 public key even
+        // when both derive from the same seed.
+        let id = DeviceIdentity::generate();
+        assert_ne!(
+            id.public_key(),
+            id.noise_public_key(),
+            "the signing key and the Noise static key must not be the same value"
+        );
+    }
+
+    #[test]
+    fn the_two_private_subkeys_are_independent_of_each_other_and_of_the_seed() {
+        let id = DeviceIdentity::generate();
+        let master = id.expose_seed();
+        let noise = id.expose_noise_secret();
+        // Neither subkey may equal the master seed, or compromising one would
+        // hand over everything derived from it.
+        assert_ne!(noise.as_ref(), master.as_ref());
+    }
+
+    #[test]
+    fn the_noise_key_is_deterministic_from_the_seed() {
+        // Required for the recovery phrase: restoring a daemon must reproduce the
+        // same Noise static key, or every paired phone would fail to connect.
+        let seed = [0x11u8; SEED_LEN];
+        assert_eq!(
+            DeviceIdentity::from_seed(seed).noise_public_key(),
+            DeviceIdentity::from_seed(seed).noise_public_key()
+        );
+    }
+
+    #[test]
+    fn distinct_seeds_give_distinct_noise_keys() {
+        let a = DeviceIdentity::from_seed([1u8; SEED_LEN]);
+        let b = DeviceIdentity::from_seed([2u8; SEED_LEN]);
+        assert_ne!(a.noise_public_key(), b.noise_public_key());
     }
 
     #[test]

@@ -1,0 +1,52 @@
+[package]
+name = "gonomad-server"
+description = "The GoNomad daemon and the `gonomad` command-line interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "gonomad"
+path = "src/main.rs"
+
+[dependencies]
+gonomad-proto = { workspace = true }
+gonomad-core = { workspace = true }
+gonomad-store = { workspace = true }
+gonomad-policy = { workspace = true }
+gonomad-pty = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+# Renders the pairing ticket as a QR code in the terminal. Tiny, pure Rust, and
+# the alternative is telling the user to type a 190-character base32 string.
+qrcode = { version = "0.14", default-features = false }
+dirs = "5.0"
+# Canonicalisation without the \\?\ verbatim prefix, so paths printed to a user
+# and stored as workspace roots look like paths they recognise.
+dunce = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"

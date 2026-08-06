@@ -7,6 +7,7 @@ members = [
     "crates/gonomad-policy",
     "crates/gonomad-transport",
     "crates/gonomad-pty",
+    "crates/gonomad-server",
 ]
 
 # Crates added as milestones land (see plan.md):

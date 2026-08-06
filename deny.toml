@@ -1,0 +1,286 @@
+# cargo-deny configuration for GoNomad.
+#
+# See ARCHITECTURE.md §3.11 (supply chain and build integrity) and plan.md's
+# definition-of-done ("`cargo deny check` + `cargo audit` clean").
+#
+# This file is a *gate*, not a rubber stamp. If a check here fails, the correct
+# response is to change the dependency or write down why the exception is safe —
+# not to widen the allowlist reflexively.
+#
+# Reproduce locally:
+#     cargo install cargo-deny --locked
+#     cargo deny check
+#
+# Schema targets cargo-deny 0.20.x (the version baked into the pinned
+# EmbarkStudios/cargo-deny-action SHA in .github/workflows/security.yml).
+# Bump the action SHA and this comment together.
+
+# ---------------------------------------------------------------------------
+# Graph — which dependency graph the checks below are evaluated against.
+# ---------------------------------------------------------------------------
+[graph]
+# Restricting the target set stops us from failing on, say, a macOS-only
+# transitive dependency that we never actually compile. Windows is the
+# first-class host; Linux is here because CI builds it to keep the codebase
+# portable for M6. Add the macOS and `aarch64-linux-android` triples when
+# those hosts/ABIs actually land (plan.md M6 / M1 Android).
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+# Dev-dependencies are *not* excluded. `proptest`, `insta` and `criterion` run
+# on developer machines and in CI; a compromised test-only crate still executes
+# arbitrary code with a developer's privileges. Auditing them is the point.
+exclude-dev = false
+
+# Evaluate with all features enabled, so a feature that is off today but on
+# tomorrow cannot smuggle in an unreviewed dependency.
+all-features = true
+
+[output]
+# Show the full path from a workspace crate to the offending crate, not just
+# the first hop. Makes "why is this even here?" answerable from the CI log.
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories — RustSec vulnerability and maintenance database.
+# ---------------------------------------------------------------------------
+[advisories]
+# In cargo-deny >= 0.18 every advisory (vulnerability, unsound, notice) is
+# denied by default and the old per-kind booleans were removed; the only knobs
+# left are the ones below.
+
+# "all" is the strictest setting: an unmaintained crate anywhere in the graph —
+# including transitively — fails the build. The looser default is "workspace",
+# which only flags direct dependencies. We take the strict reading because a
+# transitively unmaintained parser is exactly the thing that bites a security
+# tool, and because our dependency set is deliberately small enough (§3.11)
+# that the noise is affordable. If this ever becomes unmanageable, downgrade to
+# "workspace" in a commit that says so out loud rather than adding blanket
+# ignores.
+unmaintained = "all"
+
+# A yanked crate in Cargo.lock breaks reproducibility (§24.12): a fresh
+# `cargo fetch` may no longer be able to resolve it.
+yanked = "deny"
+
+# Advisory IDs to ignore. EVERY entry needs a reason and, ideally, a link to
+# the issue tracking its removal. An empty list is the goal state.
+ignore = [
+    # Example of the required shape — keep this commented out:
+    # { id = "RUSTSEC-0000-0000", reason = "not reachable: we never call X; tracked in #123" },
+]
+
+# Fetch the advisory DB with the `git` CLI rather than the built-in
+# implementation. Slower, but it honours proxies and corporate CA bundles,
+# which the built-in fetcher does not.
+git-fetch-with-cli = false
+
+# ---------------------------------------------------------------------------
+# Licences — what we are allowed to ship in an Apache-2.0 binary.
+# ---------------------------------------------------------------------------
+[licenses]
+# NOTE ON HOW DENY WORKS HERE: since cargo-deny 0.14 there is no `deny` list
+# for licences. The allowlist below *is* the denylist — anything whose SPDX
+# expression cannot be satisfied by these terms fails the check.
+#
+# That is how "no copyleft" is enforced: GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-*,
+# MPL-2.0, EUPL and friends are absent from this list and therefore denied.
+# GoNomad ships as a distributed, statically linked binary (§24.12), so linking
+# a GPL/LGPL crate would impose obligations on every user who redistributes a
+# build. Do not add one without a licence review; there is essentially always a
+# permissive alternative in the Rust ecosystem.
+#
+# MPL-2.0 is a deliberate omission rather than an oversight: it is file-level
+# copyleft and generally fine for a distributed binary, but it obliges us to
+# publish modified MPL files. We would rather make that a conscious decision
+# per crate (via `exceptions` below) than a standing allowance.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # rustix / wasi / linux-raw-sys style dual licensing
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",      # unicode-ident and the unicode-* family
+    "Unicode-DFS-2016", # older spelling still present in some pinned crates
+    "Zlib",
+    "0BSD",             # adler2 and similar; strictly weaker than MIT
+
+    # UNDECIDED — CC0-1.0 and Unlicense are intentionally NOT allowed yet.
+    #
+    #   "CC0-1.0"
+    #   "Unlicense"
+    #
+    # Both are public-domain dedications rather than licences. Neither grants
+    # patent rights, and CC0 explicitly *withholds* them — which is awkward for
+    # a project that chose Apache-2.0 specifically for its patent grant
+    # (plan.md, "Locked decisions"). Some organisations' legal teams reject CC0
+    # outright, and the FSF/OSI status of Unlicense is muddy. Decide before the
+    # v0.1.0 release (plan.md M6), record the outcome in ARCHITECTURE.md, and
+    # then either add them here or vendor/replace the crates that need them.
+    # Until then a CC0/Unlicense dependency fails CI on purpose.
+]
+
+# Below this confidence the licence-text matcher refuses to guess and the crate
+# must be clarified explicitly. 0.93 is cargo-deny's default; lowering it trades
+# correctness for convenience.
+confidence-threshold = 0.93
+
+# Flag entries in `allow` that nothing in the graph actually uses, so this list
+# does not silently accumulate cruft. "warn" rather than "deny" because the set
+# of reachable crates legitimately differs per target and per feature set.
+unused-allowed-license = "warn"
+
+# Dev-dependencies are shipped to contributors, not to users, but they still
+# get audited — same reasoning as `exclude-dev` above.
+include-dev = true
+
+[licenses.private]
+# GoNomad's own crates are `publish = false`/workspace-internal in places;
+# don't demand licence metadata resolution for them (they are all Apache-2.0
+# via `[workspace.package]`).
+ignore = true
+
+# --- Per-crate exceptions -------------------------------------------------
+# An exception allows a licence for exactly one crate rather than globally, and
+# is the right tool when a single dependency needs a term we do not want to
+# bless project-wide. Prefer it over widening `allow`. Every entry needs a
+# comment explaining why the term is acceptable for that crate specifically.
+#
+# The list is empty today. The shape is:
+#
+#   [[licenses.exceptions]]
+#   crate = "ring"
+#   allow = ["OpenSSL"]   # see the clarification below before doing this
+#
+# Note that a live exception removes that licence from the "encountered" set
+# for the global `allow` list, so cargo-deny will start warning that the global
+# allowance is unused. That is expected, not a bug.
+
+# --- Clarifications -------------------------------------------------------
+# Some crates have licence metadata that an SPDX parser cannot act on: a
+# missing `license` field, a compound "MIT AND ISC AND OpenSSL" that is really
+# a description of several vendored files, or a LICENSE file the matcher scores
+# below `confidence-threshold`. A clarification tells cargo-deny "we read the
+# licence files ourselves; this expression is the answer", and pins the file
+# hash so the answer is invalidated if the text ever changes.
+#
+# `ring` is the canonical case and it WILL enter this graph: it arrives under
+# rustls/quinn/iroh when `gonomad-transport` lands at M1. It is pre-declared
+# here so that the day it appears, CI fails on a licence *decision* we have not
+# made yet rather than on a parser confusion we already understand.
+#
+# When ring does land:
+#   1. cargo-deny will report the actual LICENSE hash if the one below is
+#      stale — read the licence file yourself before pasting the new number.
+#   2. ring's expression contains the `OpenSSL` term. That term is NOT in the
+#      `allow` list above, deliberately. Adding it is a real legal decision
+#      (advertising-clause-adjacent, Apache-2.0-incompatible in the FSF's
+#      reading of OpenSSL 1.x), so it must be made explicitly, in review,
+#      preferably as an `[[licenses.exceptions]]` entry scoped to ring alone.
+#   3. Note this is unrelated to the `openssl-sys` ban further down: that ban
+#      is about not linking a *system* OpenSSL, not about licence text.
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+# ---------------------------------------------------------------------------
+# Bans — crates we refuse, and duplicate-version hygiene.
+# ---------------------------------------------------------------------------
+[bans]
+# Two copies of the same crate mean two copies of its bugs, two copies of its
+# code in the binary, and — for anything with global state or a public type in
+# our API — genuinely confusing behaviour. Deny by default, then skip
+# specifically. The Rust ecosystem forces some duplication during major-version
+# transitions, so the `skip` list below is a pragmatic escape hatch, not a
+# failure of nerve.
+multiple-versions = "deny"
+multiple-versions-include-dev = true
+
+# `version = "*"` in a manifest defeats `--locked` and reproducible builds
+# (§24.12): the resolved version depends on when you ran `cargo update`.
+wildcards = "deny"
+# Path dependencies inside the workspace may use wildcards; ours pin a version
+# anyway, but this keeps the rule from being annoying if that changes.
+allow-wildcard-paths = true
+
+# Print the whole reverse-dependency tree for a duplicate, so the CI log tells
+# you which crate to nudge rather than just that a duplicate exists.
+highlight = "all"
+
+# Workspace crates must not enable default features on each other implicitly;
+# feature unification surprises are a real source of "works on my machine".
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# --- Crates that must never appear ---------------------------------------
+deny = [
+    { crate = "openssl-sys", reason = "GoNomad ships as a single static binary with no system dependencies (ARCHITECTURE.md §24.12, plan.md 'one static binary'). openssl-sys links a system OpenSSL, which breaks that promise, breaks reproducible builds, and makes the Android build a cross-compilation nightmare. Use rustls (which is what iroh/quinn pull in anyway).", use-instead = "rustls" },
+    { crate = "openssl", reason = "Same as openssl-sys: pulls a C TLS stack and a system dependency into a binary that is supposed to have neither.", use-instead = "rustls" },
+    { crate = "native-tls", reason = "A thin shim over whatever TLS the host happens to have (SChannel/Secure Transport/OpenSSL). Non-reproducible, platform-divergent, and it puts our transport security in the hands of a system library we do not pin.", use-instead = "rustls" },
+    { crate = "git2", reason = "ARCHITECTURE.md §18.1 / plan.md M4: git reads go through `gix`, git mutations shell out to the user's own `git` binary so that hooks, credential helpers and commit signing behave exactly as they do on the desktop. Linking libgit2 would reintroduce a C dependency AND silently bypass the user's git config.", use-instead = "gix" },
+
+    # Not banned but worth knowing about, kept as comments so the reasoning
+    # survives:
+    #   `chrono` — pulls the old `time` 0.1 on some versions; the workspace
+    #   standardises on `time` 0.3. Add a ban if it ever sneaks in.
+]
+
+# --- Duplicate-version escape hatch --------------------------------------
+# Every entry should be temporary and should say what unblocks its removal.
+# Keeping this list short is a maintenance task, not a formality.
+skip = [
+    # Example of the required shape — keep this commented out:
+    # { crate = "windows-sys", reason = "rusqlite and tempfile are mid-migration; remove once both are on 0.60" },
+]
+
+# `skip-tree` skips a crate AND everything below it. It is a much bigger hammer
+# than `skip` — a whole subtree stops being deduplicated — so it stays empty
+# unless a single dependency drags in an entire parallel ecosystem version.
+skip-tree = []
+
+# --- Build-time code execution -------------------------------------------
+# cargo-deny can also refuse crates that ship precompiled executables or run
+# unexpected build scripts, which is the sharpest supply-chain control it has
+# (§3.11). It is intentionally NOT enabled yet: the workspace is three crates
+# old and turning it on now would produce a wall of findings against
+# `windows-*` sys crates (which legitimately ship .lib files) that nobody has
+# the context to triage. Enable it at M6 alongside the reproducible-build work,
+# when the dependency set is stable enough for the baseline to mean something.
+#
+# [bans.build]
+# executables = "deny"
+# interpreted = "deny"
+# allow-build-scripts = []
+
+# ---------------------------------------------------------------------------
+# Sources — where code is allowed to come from.
+# ---------------------------------------------------------------------------
+# This is the supply-chain control that actually stops the "helpful" PR that
+# swaps a crates.io dependency for someone's fork. crates.io artifacts are
+# immutable and checksummed in Cargo.lock; a git dependency is a moving target
+# controlled by whoever holds the repo.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# No git dependencies. If M1's transport work needs an unreleased iroh fix, the
+# options in order of preference are: (1) wait for the release, (2) vendor the
+# patch, (3) add the exact repository here *pinned to a rev* with a reason and
+# a tracking issue, and remove it the moment upstream publishes.
+allow-git = []
+
+# Organisation-level allowances are deliberately empty: trusting an entire
+# GitHub org is trusting every member's account, forever.
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

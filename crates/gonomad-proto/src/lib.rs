@@ -13,6 +13,9 @@
 //! | [`ids`] | Cryptographic identifiers: [`PublicKey`], [`DeviceId`], [`Digest`] |
 //! | [`capability`] | The authorization vocabulary: [`Capability`], [`CapabilitySet`] |
 //! | [`error`] | The closed protocol error enum: [`ProtoError`] |
+//! | [`frame`] | Wire framing and the length-prefixed codec: [`Frame`], [`FrameFlags`] |
+//! | [`control`] | Handshake and request/response envelope: [`ControlMessage`] |
+//! | [`events`] | Server-pushed events: [`Event`], [`EventPayload`] |
 //!
 //! ## Design rules for this crate
 //!
@@ -32,11 +35,23 @@
 // allowed in the manifest.
 
 pub mod capability;
+pub mod control;
 pub mod error;
+pub mod events;
+pub mod frame;
 pub mod ids;
 
 pub use capability::{Capability, CapabilitySet};
+pub use control::{
+    ControlMessage, CorrelationId, Heartbeat, Hello, HelloOk, HelloReject, RejectReason, Request,
+    Response, ResponseBody, SessionId,
+};
 pub use error::{ErrorKind, ProtoError};
+pub use events::{
+    AgentState, ApprovalRequest, Destructiveness, Event, EventPayload, FileChange, FileChangeKind,
+    TaskOutcome,
+};
+pub use frame::{Frame, FrameError, FrameFlags};
 pub use ids::{DeviceId, Digest, PublicKey};
 
 /// The wire protocol version this build speaks.

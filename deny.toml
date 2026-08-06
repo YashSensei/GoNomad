@@ -70,6 +70,13 @@ yanked = "deny"
 ignore = [
     # Example of the required shape — keep this commented out:
     # { id = "RUSTSEC-0000-0000", reason = "not reachable: we never call X; tracked in #123" },
+
+    { id = "RUSTSEC-2017-0008", reason = "`serial` is unmaintained and is pulled in by portable-pty, which is the only mature cross-platform PTY crate with real ConPTY support (ARCHITECTURE.md 18.1). GoNomad never opens a serial port: the code path is portable-pty's serial-PTY backend, which we do not construct. This one DOES ship in the daemon binary, unlike the two below, so it is the entry to revisit first. Removing it means either upstream dropping the dependency or us vendoring the ConPTY half of portable-pty." },
+
+
+    { id = "RUSTSEC-2025-0141", reason = "`paste` is unmaintained. It is a proc-macro crate, so it executes at compile time and is never linked into a shipped artifact. Pulled in by uniffi_core and uniffi_bindgen." },
+
+    { id = "RUSTSEC-2024-0436", reason = "`bincode` 1.x is unmaintained. Reached only via uniffi_macros, which is a proc-macro and therefore build-time only; no bincode code ships in the daemon or the Android library." },
 ]
 
 # Fetch the advisory DB with the `git` CLI rather than the built-in
@@ -85,17 +92,18 @@ git-fetch-with-cli = false
 # for licences. The allowlist below *is* the denylist — anything whose SPDX
 # expression cannot be satisfied by these terms fails the check.
 #
-# That is how "no copyleft" is enforced: GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-*,
-# MPL-2.0, EUPL and friends are absent from this list and therefore denied.
+# That is how "no strong copyleft" is enforced: GPL-2.0, GPL-3.0, AGPL-3.0,
+# LGPL-*, EUPL and friends are absent from this list and therefore denied.
 # GoNomad ships as a distributed, statically linked binary (§24.12), so linking
 # a GPL/LGPL crate would impose obligations on every user who redistributes a
 # build. Do not add one without a licence review; there is essentially always a
 # permissive alternative in the Rust ecosystem.
 #
-# MPL-2.0 is a deliberate omission rather than an oversight: it is file-level
-# copyleft and generally fine for a distributed binary, but it obliges us to
-# publish modified MPL files. We would rather make that a conscious decision
-# per crate (via `exceptions` below) than a standing allowance.
+# MPL-2.0 *is* allowed, with reasoning at the entry below. It is file-level
+# copyleft, which behaves quite differently from the GPL family: the obligation
+# attaches to the MPL files themselves rather than to the work that links them.
+# The practical constraint it imposes is that modifying a vendored MPL crate
+# becomes a licence decision, not merely a technical one.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception", # rustix / wasi / linux-raw-sys style dual licensing
@@ -107,6 +115,27 @@ allow = [
     "Unicode-3.0",      # unicode-ident and the unicode-* family
     "Unicode-DFS-2016", # older spelling still present in some pinned crates
     "Zlib",
+
+    # MPL-2.0 is weak, *file-level* copyleft: the obligation attaches to the
+    # MPL-licensed files themselves, not to a work that links them. Section 3.3
+    # explicitly permits distributing a "Larger Work" under other terms. We ship
+    # these crates unmodified, so there is nothing to reciprocate, and an
+    # Apache-2.0 binary that links them is fine.
+    #
+    # This is a deliberate exception to the "deny copyleft" rule below, which
+    # targets GPL/AGPL/LGPL — those reach the whole linked work and would be
+    # incompatible with distributing GoNomad as a binary.
+    #
+    # In the graph because of:
+    #   uniffi, uniffi_core, uniffi_macros, uniffi_bindgen, uniffi_meta,
+    #   uniffi_udl, uniffi_checksum_derive, uniffi_testing  (Mozilla — the
+    #     Rust/Kotlin bridge, ARCHITECTURE.md 18.2)
+    #   option-ext  (via `dirs`, used to locate the daemon's state directory)
+    #
+    # If a future dependency arrives under MPL-2.0 and we *modify* it, that
+    # modification must be published. Vendoring an MPL crate and patching it is
+    # therefore a licence decision, not just a technical one.
+    "MPL-2.0",
     "0BSD",             # adler2 and similar; strictly weaker than MIT
 
     # UNDECIDED — CC0-1.0 and Unlicense are intentionally NOT allowed yet.
@@ -249,6 +278,16 @@ skip = [
     # --- syn 2 -> 3 -------------------------------------------------------
     # Proc-macro only: costs compile time, not binary size.
     { crate = "syn@2", reason = "serde_derive and thiserror-impl are on syn 3; tracing-attributes, zerocopy-derive and zeroize_derive are still on syn 2. Remove once those derive crates publish syn 3 releases." },
+
+    # --- introduced by uniffi (the Rust/Kotlin bridge) --------------------
+    # uniffi 0.28 brings ~50 build-time crates whose dependency pins predate
+    # the current ecosystem. All four below are build-time or proc-macro paths;
+    # none adds a second copy to a shipped artifact. They resolve when uniffi
+    # publishes against newer pins, which is not something we can force.
+    { crate = "thiserror@1", reason = "uniffi's cargo_metadata 0.15 pins thiserror 1, and portable-pty's filedescriptor already did before uniffi arrived; the workspace itself is on thiserror 2. Build-time only." },
+    { crate = "thiserror-impl@1", reason = "proc-macro half of thiserror@1 above; same cause, same fix." },
+    { crate = "bitflags@1", reason = "reached through uniffi's build-time graph; the workspace and portable-pty are on bitflags 2." },
+    { crate = "windows-sys@0.48", reason = "windows-sys 0.48 arrives through uniffi's build-time graph; the daemon's own Windows surface (portable-pty, rusqlite, tokio) is on 0.61." },
 
     # --- the rand / getrandom 0.6 -> 0.9 split ----------------------------
     # One root cause, five symptoms. The RustCrypto stack (snow, ed25519-dalek,

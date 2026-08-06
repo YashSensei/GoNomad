@@ -1,0 +1,57 @@
+[package]
+name = "gonomad-ffi"
+description = "GoNomad UniFFI bridge: the Rust core exposed to Kotlin."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+# `cdylib` is what `cargo-ndk` packages into the APK and what `uniffi-bindgen
+# --library` inspects; `lib` keeps the crate linkable from Rust so the tests and
+# the bindgen binary below can use it. Dropping either breaks one consumer.
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+# The standard UniFFI pattern: the generator is built *by this crate* so it links
+# the same `uniffi` version that produced the scaffolding. A mismatch between
+# generator and scaffolding is the most common UniFFI build failure, and building
+# it here makes that unrepresentable. The Android Gradle build invokes this.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+gonomad-proto = { workspace = true }
+gonomad-core = { workspace = true }
+gonomad-transport = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+# Not a workspace dependency: only this crate uses it, and the `cli` feature is
+# what `src/bin/uniffi-bindgen.rs` needs.
+uniffi = { version = "0.28", features = ["cli"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+# Deliberately not `forbid`, unlike every other crate in the workspace. UniFFI's
+# generated scaffolding is a set of `extern "C"` shims that rebuild `Arc`s from
+# raw pointers, so it contains `unsafe` by construction, and `forbid` cannot be
+# overridden locally — it would make the crate unbuildable. There is no
+# hand-written `unsafe` anywhere in `src/`.
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"

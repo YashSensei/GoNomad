@@ -1,0 +1,35 @@
+# cargo-audit configuration.
+#
+# `cargo-deny` and `cargo-audit` are separate tools with separate config, and CI
+# runs both (see .github/workflows/security.yml). An advisory ignored in
+# deny.toml is NOT ignored here — the lists have to be kept in step, which is
+# why every entry below points at its deny.toml twin.
+#
+# Keeping both is deliberate rather than redundant: cargo-audit tracks the
+# RustSec database closely and reports advisories cargo-deny's cached graph can
+# miss, so it is the earlier warning of the two.
+
+[advisories]
+ignore = [
+    # `serial` is unmaintained, via portable-pty. This is the only entry here
+    # that ships in the daemon binary. GoNomad never opens a serial port; the
+    # code is portable-pty's serial-PTY backend, which we do not construct.
+    # Removing it means upstream dropping the dependency, or vendoring the
+    # ConPTY half of portable-pty. See ARCHITECTURE.md 18.1 for why
+    # portable-pty was chosen despite this.
+    "RUSTSEC-2017-0008",
+
+
+    # `paste` unmaintained. A proc-macro, so compile-time only; never linked
+    # into a shipped artifact.
+    "RUSTSEC-2025-0141",
+
+    # `bincode` 1.x unmaintained, via uniffi_macros. Proc-macro, build-time only.
+    "RUSTSEC-2024-0436",
+]
+
+# Fail on anything not explicitly ignored above, including unmaintained and
+# yanked crates. The default only fails on vulnerabilities, which would let an
+# unmaintained dependency slip in silently.
+informational_warnings = ["unmaintained", "unsound", "notice"]
+severity_threshold = "none"

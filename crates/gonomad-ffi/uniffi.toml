@@ -1,0 +1,9 @@
+# UniFFI binding-generation settings.
+#
+# `package_name` is set because the Android app already codes against
+# `dev.gonomad.ffi.GonomadClient` (see
+# `android/app/src/main/java/dev/gonomad/app/ffi/ClientProvider.kt`). Without it
+# the generator would emit `uniffi.gonomad_ffi`, and the Kotlin side would have to
+# change an import that the FFI contract owns.
+[bindings.kotlin]
+package_name = "dev.gonomad.ffi"

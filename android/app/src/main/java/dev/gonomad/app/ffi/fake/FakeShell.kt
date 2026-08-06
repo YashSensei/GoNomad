@@ -279,6 +279,22 @@ internal class FakeShell(
         while (lines.size > SCROLLBACK) lines.removeFirst()
     }
 
+    /// The current screen, without notifying the listener.
+    ///
+    /// Used when reattaching after a reconnect: the caller wants the frame
+    /// returned to it, and pushing to the listener as well would deliver the same
+    /// screen twice.
+    fun currentFrame(): TerminalFrame {
+        val current = prompt() + input.toString()
+        val screen = (lines + current).joinToString("\n")
+        return TerminalFrame(
+            ptyId = ptyId,
+            screen = screen,
+            cursorRow = lines.size.coerceAtMost(UShort.MAX_VALUE.toInt()).toUShort(),
+            cursorCol = current.length.coerceAtMost(UShort.MAX_VALUE.toInt()).toUShort(),
+        )
+    }
+
     private fun push(): TerminalFrame {
         val current = prompt() + input.toString()
         val screen = (lines + current).joinToString("\n")

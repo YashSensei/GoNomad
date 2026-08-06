@@ -116,11 +116,28 @@ val ndkPath: String? = System.getenv("ANDROID_NDK_HOME")
         ?.maxByOrNull { it.name }
         ?.absolutePath
 
+// Every Rust file the two tasks below depend on.
+//
+// Declaring these is not optional hygiene: without them Gradle sees a task with
+// declared outputs and no declared inputs, marks it UP-TO-DATE forever, and
+// happily packages a stale .so. The app then calls a function the library does
+// not contain, which surfaces at runtime as a native crash rather than a build
+// error. Verified by editing a Rust file and confirming the task reruns.
+val rustInputs: FileTree = fileTree(rustRoot) {
+    include("crates/**/*.rs")
+    include("crates/**/Cargo.toml")
+    include("Cargo.toml")
+    include("Cargo.lock")
+    include("rust-toolchain.toml")
+    exclude("**/target/**")
+}
+
 val cargoNdkBuild by tasks.registering(Exec::class) {
     group = "rust"
     description = "Cross-compiles gonomad-ffi for arm64-v8a into build/rustJniLibs."
 
     val outDir = layout.buildDirectory.dir("rustJniLibs").get().asFile
+    inputs.files(rustInputs).withPropertyName("rustSources")
     outputs.dir(outDir)
 
     // Fail at configuration with something actionable rather than letting cargo
@@ -162,6 +179,7 @@ val uniffiBindings by tasks.registering(Exec::class) {
     description = "Generates Kotlin bindings for gonomad-ffi from the host library."
 
     val outDir = layout.buildDirectory.dir("generated/uniffi").get().asFile
+    inputs.files(rustInputs).withPropertyName("rustSources")
     outputs.dir(outDir)
 
     workingDir = rustRoot
@@ -178,6 +196,11 @@ val uniffiBindings by tasks.registering(Exec::class) {
 val cargoHostBuild by tasks.registering(Exec::class) {
     group = "rust"
     description = "Builds the host gonomad-ffi library, whose symbols UniFFI reads."
+    // Same reasoning as cargoNdkBuild: without declared inputs this would go
+    // UP-TO-DATE and uniffiBindings would regenerate from a stale host library,
+    // producing Kotlin that does not match the .so actually shipped.
+    inputs.files(rustInputs).withPropertyName("rustSources")
+    outputs.file(hostLibrary)
     workingDir = rustRoot
     commandLine(cargoBin, "build", "--quiet", "-p", "gonomad-ffi")
 }

@@ -9,6 +9,7 @@ import dev.gonomad.ffi.GonomadClientInterface
 import dev.gonomad.ffi.GonomadException
 import dev.gonomad.ffi.Status
 import dev.gonomad.ffi.StatusListener
+import dev.gonomad.ffi.TerminalFrame
 import dev.gonomad.ffi.TerminalHandle
 import dev.gonomad.ffi.TerminalListener
 import kotlinx.coroutines.CoroutineScope
@@ -276,6 +277,22 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClientInterface {
         // The contract returns the first frame with the id, so the caller never
         // has to render a blank screen while waiting for a poll.
         return TerminalHandle(ptyId = id, initial = shell.banner())
+    }
+
+    override suspend fun listTerminals(): List<ULong> {
+        requireConnected()
+        // The fake's shells outlive `disconnect()` exactly as the daemon's PTYs
+        // do, so reconnecting finds them again. A fake that dropped them here
+        // would hide the very behaviour these methods exist to support.
+        return shells.keys.sorted()
+    }
+
+    override suspend fun attachTerminal(ptyId: ULong): TerminalFrame {
+        requireConnected()
+        val shell = shells[ptyId] ?: throw GonomadException.NotFound()
+        // Returns the current screen rather than a banner: a restored tab should
+        // show the output that accumulated while the app was away.
+        return shell.currentFrame()
     }
 
     override suspend fun sendInput(ptyId: ULong, data: String) {

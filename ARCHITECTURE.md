@@ -238,9 +238,11 @@ The stated requirement is to design as though the user's entire workstation is e
 | T7 | Prompt-injected AI agent | Proposes malicious edits or commands | True-diff rendering (never the agent's summary), destructive-op detection, biometric gate |
 | T8 | Malicious dependency in our own supply chain | Code execution in the daemon | `cargo-deny`, `cargo-audit`, vendored lockfile, minimal dependency set, reproducible builds |
 | T9 | Rogue paired device (given away, sold, compromised) | Valid credential | Instant server-side revocation, per-device audit trail, capability minimisation |
-| T10 | Local unprivileged process on the laptop | Reads daemon files, connects to loopback | Keys in OS keyring not files; loopback control socket is peer-credential checked |
+| T10 | Local process running as a **different** OS user | Reads daemon files, connects to loopback | Keys in OS keyring not files; loopback control socket is peer-credential checked |
 
 **Explicitly out of the model:** a compromised laptop OS with root/admin. If the attacker owns the machine that runs the compiler, GoNomad cannot help — and any design that claims otherwise is lying.
+
+**Also out of the model, and worth naming precisely because T10 could be read as covering it:** a process running as *the same OS user* as the daemon. Such a process can already read the source tree, and on most platforms it can ask the keyring for the daemon's identity key, because the keyring's access control is the user account. GoNomad raises the cost — keys are not sitting in a readable file, and the control socket checks peer credentials — but it does not and cannot stop a same-user attacker. The security boundary is the OS user account, not the process.
 
 ### 3.2 Identity, not tokens
 
@@ -314,7 +316,7 @@ Authentication answers *who*. Authorisation answers *what*, and it is where most
 | `fs:secrets` | Read denylisted paths | ❌ |
 | `pty:spawn` | Open a shell | ✅ |
 | `exec:allowlisted` | Run commands matching the project's allowlist | ✅ |
-| `exec:arbitrary` | Run anything | ❌ (implied by `pty:spawn`; see below) |
+| `exec:arbitrary` | Run anything via the structured `exec` API | ❌ |
 | `git:read` | Status, log, diff, blame | ✅ |
 | `git:write` | Commit, push, pull, branch, stash | ✅ |
 | `git:dangerous` | Force push, hard reset, history rewrite | ❌ |
@@ -567,7 +569,7 @@ autostart = true
 
 [[workspace]]
 name = "gonomad"
-path = "C:/Users/yasha/OneDrive/Desktop/bigones/gonomad"
+path = "C:/Users/you/code/gonomad"
 default_shell = "pwsh"
 
 [policy]
@@ -1372,7 +1374,8 @@ gonomad/
 │  └─ {claude-code,codex,gemini,opencode,aider,generic}.toml
 │
 ├─ docs/
-│  ├─ protocol.md  security.md  deployment.md  contributing.md
+│  ├─ README.md  deployment.md  threat-model.md  glossary.md  ci.md
+│  ├─ protocol.md  adapters.md          # land with M1 / M5
 │  └─ threat-model.md  adapters.md
 │
 └─ .github/workflows/            # ci · bench · release (reproducible + signed)
@@ -1755,7 +1758,7 @@ The trust argument for a self-hosted security tool collapses if users cannot ver
 
 - **First-run performance on a huge monorepo** — the FST index build must be cancellable, visibly progressing, and never block the UI. A user's first experience must not be a frozen tree.
 - **WSL path translation** — a WSL PTY's cwd is a Linux path; the FS layer must not assume the host's namespace (§8.2).
-- **OneDrive and synced folders** — this repository lives under OneDrive. Cloud-sync engines produce spurious watcher events, placeholder files that block on read, and lock contention. Detect synced roots and warn, and treat reparse-point placeholders as a distinct file kind.
+- **Cloud-synced folders (OneDrive, Dropbox, iCloud Drive)** — developers routinely keep projects inside them, and sync engines produce spurious watcher events, placeholder files that block on read, and lock contention. Detect synced roots and warn, and treat reparse-point placeholders as a distinct file kind.
 - **Long paths on Windows** — `MAX_PATH` requires `\\?\` prefixing and opt-in long-path support; deep `node_modules` trees hit this routinely.
 - **Terminal bell and vibration** — a bell should be a haptic, not a sound, and should be mutable.
 - **Battery-saver mode** should drop frame rate and disable the background connection automatically.

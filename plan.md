@@ -3,9 +3,13 @@
 > **Your development machine, anywhere.**
 > An open-source, self-hosted mobile companion for your own dev machine. Not a desktop stream — a purpose-built touch interface over the filesystem, terminals, git, and AI agents already on your laptop.
 
-**Current status:** 📋 Design complete · pre-implementation · nothing built yet
-**Next action:** M0 spikes (§M0) — four throwaway experiments to retire risk before committing to the architecture
+**Current status:** 🚧 Pre-alpha · **M1 in progress** · not yet usable
+**Built so far:** `gonomad-proto` (wire contract + codec), `gonomad-core` (device identity, pairing, SAS), `gonomad-store` (schema, migrations, hash-chained audit), `gonomad-policy` (capabilities, path guards, rate limits). ~405 tests, clippy pedantic clean. No daemon binary, no transport, no Android app yet — nothing to run.
+**Next action:** finish M1 — iroh transport, the Noise IK session, and the `gonomad` CLI
 **Canonical design:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) — this file is the execution roadmap; that file is the *why*
+
+> [!NOTE]
+> M0's spikes were partially superseded: the ConPTY and Compose-Canvas spikes are still outstanding and gate M2, but the workspace scaffold and shared-type contract were built first because every other crate depends on them.
 
 ---
 
@@ -131,7 +135,8 @@ The security foundation is built first because retrofitting it is not possible.
 - [ ] Full security review against the §3.1 threat model; external audit if funded
 - [ ] Accessibility pass; `armeabi-v7a` + `x86_64` ABIs
 - [ ] **Reproducible builds** verified in CI (build twice, compare hashes); `cosign` signing + SLSA provenance; `apksigner`-verifiable APK
-- [ ] Docs — `protocol.md`, `security.md`, `threat-model.md`, `deployment.md`, `adapters.md`, `contributing.md`, `SECURITY.md` + PGP key
+- [ ] Docs — `docs/protocol.md` and `docs/adapters.md` (the only two still unwritten), plus a published PGP key for `SECURITY.md`
+      <br>*(`README`, `CONTRIBUTING`, `CODE_OF_CONDUCT`, `SECURITY`, `docs/{README,deployment,threat-model,glossary,ci}.md` already landed)*
 - [ ] `gonomad uninstall` — complete, and documented before anyone asks
 - [ ] **v0.1.0**
 

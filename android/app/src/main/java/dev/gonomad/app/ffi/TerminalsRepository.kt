@@ -135,6 +135,61 @@ class TerminalsRepository(
         return tab.ptyId
     }
 
+    /**
+     * Reattaches to every terminal still running on the machine.
+     *
+     * Call this after connecting. The machine owns the terminals and never
+     * stopped them, so after a dropped connection, an app restart, or a phone
+     * reboot they are all still there — this is how they come back.
+     *
+     * Without it the terminals would still be *running* and simply unreachable,
+     * which from the user's chair is the same as having lost the work.
+     *
+     * Tabs already present keep their `cwd` and geometry; ids the machine no
+     * longer reports are dropped, because the shell has exited and been reaped.
+     * A reattach that fails for one terminal does not abandon the others.
+     */
+    suspend fun restoreFromMachine() {
+        val live = runCatching { client.listTerminals() }.getOrElse { return }
+
+        // Anything the machine no longer lists is gone for good.
+        _tabs.update { current -> current.filter { it.ptyId in live } }
+
+        for (ptyId in live) {
+            val frame = runCatching { client.attachTerminal(ptyId) }.getOrNull() ?: continue
+            _tabs.update { current ->
+                val existing = current.firstOrNull { it.ptyId == ptyId }
+                val restored = existing?.copy(
+                    screen = frame.screen,
+                    cursorRow = frame.cursorRow,
+                    cursorCol = frame.cursorCol,
+                    runState = TerminalRunState.RUNNING,
+                    // Output may well have arrived while the app was away.
+                    hasUnread = existing.ptyId != _activeId.value,
+                ) ?: TerminalTab(
+                    ptyId = ptyId,
+                    // A terminal restored across an app restart has no cwd the
+                    // phone remembers; the title falls back to the id rather
+                    // than inventing a path that might be wrong.
+                    cwd = "",
+                    screen = frame.screen,
+                    cursorRow = frame.cursorRow,
+                    cursorCol = frame.cursorCol,
+                    runState = TerminalRunState.RUNNING,
+                    hasUnread = true,
+                    cols = UNMEASURED,
+                    rows = UNMEASURED,
+                )
+                current.filterNot { it.ptyId == ptyId } + restored
+            }
+        }
+
+        // Keep the previous selection if it survived, otherwise show the first.
+        if (_activeId.value !in live) {
+            _activeId.value = _tabs.value.firstOrNull()?.ptyId
+        }
+    }
+
     /** Shows a tab. Kills nothing — the other terminals keep running. */
     fun select(ptyId: ULong) {
         _activeId.value = ptyId

@@ -472,6 +472,15 @@ impl Slot {
     pub const fn class(&self) -> OperationClass {
         self.key.1
     }
+
+    /// Consumes the slot, yielding the bucket it belongs to.
+    ///
+    /// Takes `self` so that surrendering a slot is a move: after
+    /// [`RateLimiter::release`] has called this, the caller no longer holds a
+    /// value it could release a second time.
+    fn into_key(self) -> Key {
+        self.key
+    }
 }
 
 /// A reservation against a byte ceiling, returned by
@@ -488,6 +497,14 @@ impl ByteReservation {
     #[must_use]
     pub const fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Consumes the reservation, yielding the bucket and the amount to return.
+    ///
+    /// By value for the same reason as [`Slot::into_key`]: a reservation that
+    /// can be released twice inflates the budget permanently.
+    fn into_parts(self) -> (Key, u64) {
+        (self.key, self.bytes)
     }
 }
 
@@ -632,7 +649,11 @@ impl<C: Clock> RateLimiter<C> {
     /// [`ErrorKind::RateLimited`] with the exact wait when the bucket is empty
     /// and will refill; [`ErrorKind::ResourceExhausted`] when the budget is
     /// one-shot (pairing) and waiting cannot help.
-    pub fn try_acquire(&mut self, device: DeviceId, class: OperationClass) -> Result<(), ProtoError> {
+    pub fn try_acquire(
+        &mut self,
+        device: DeviceId,
+        class: OperationClass,
+    ) -> Result<(), ProtoError> {
         let limits = class.limits();
         if limits.refill.is_none() && limits.burst == 0 {
             // No rate configured for this class — only ceilings apply.
@@ -684,8 +705,12 @@ impl<C: Clock> RateLimiter<C> {
     }
 
     /// Returns a slot to its class.
+    ///
+    /// Consumes the slot, so releasing the same one twice — which would inflate
+    /// the ceiling by one for the life of the daemon — is a compile error.
     pub fn release(&mut self, slot: Slot) {
-        if let Some(bucket) = self.buckets.get_mut(&slot.key) {
+        let key = slot.into_key();
+        if let Some(bucket) = self.buckets.get_mut(&key) {
             bucket.in_flight = bucket.in_flight.saturating_sub(1);
         }
     }
@@ -755,9 +780,14 @@ impl<C: Clock> RateLimiter<C> {
     }
 
     /// Returns a byte reservation to its class.
+    ///
+    /// Consumes the reservation, for the same reason as
+    /// [`RateLimiter::release`]: a double release permanently inflates the
+    /// budget.
     pub fn release_bytes(&mut self, reservation: ByteReservation) {
-        if let Some(bucket) = self.buckets.get_mut(&reservation.key) {
-            bucket.bytes_in_flight = bucket.bytes_in_flight.saturating_sub(reservation.bytes);
+        let (key, bytes) = reservation.into_parts();
+        if let Some(bucket) = self.buckets.get_mut(&key) {
+            bucket.bytes_in_flight = bucket.bytes_in_flight.saturating_sub(bytes);
         }
     }
 
@@ -819,7 +849,10 @@ mod tests {
         let mut rl = limiter();
         let d = device(1);
         for i in 0..100 {
-            assert!(rl.try_acquire(d, OperationClass::FsRead).is_ok(), "read {i}");
+            assert!(
+                rl.try_acquire(d, OperationClass::FsRead).is_ok(),
+                "read {i}"
+            );
         }
         let err = rl.try_acquire(d, OperationClass::FsRead).unwrap_err();
         assert_eq!(err.kind.code(), "rate_limited");
@@ -921,7 +954,10 @@ mod tests {
         }
         let err = rl.try_acquire(d, OperationClass::Pairing).unwrap_err();
         match err.kind {
-            ErrorKind::ResourceExhausted { ref resource, limit } => {
+            ErrorKind::ResourceExhausted {
+                ref resource,
+                limit,
+            } => {
                 assert_eq!(resource, "pairing attempts");
                 assert_eq!(limit, 3);
             }
@@ -929,7 +965,8 @@ mod tests {
         }
 
         // A century of waiting changes nothing.
-        rl.clock().advance(Duration::from_secs(3_600 * 24 * 365 * 100));
+        rl.clock()
+            .advance(Duration::from_secs(3_600 * 24 * 365 * 100));
         assert!(rl.try_acquire(d, OperationClass::Pairing).is_err());
 
         // Only a fresh QR code does.
@@ -957,7 +994,10 @@ mod tests {
             .try_acquire_slot(d, OperationClass::PtySpawn)
             .unwrap_err();
         match err.kind {
-            ErrorKind::ResourceExhausted { ref resource, limit } => {
+            ErrorKind::ResourceExhausted {
+                ref resource,
+                limit,
+            } => {
                 assert_eq!(resource, "ptys");
                 assert_eq!(limit, 16);
             }
@@ -998,7 +1038,10 @@ mod tests {
         }
         let err = rl.try_acquire_slot(d, OperationClass::Watcher).unwrap_err();
         match err.kind {
-            ErrorKind::ResourceExhausted { ref resource, limit } => {
+            ErrorKind::ResourceExhausted {
+                ref resource,
+                limit,
+            } => {
                 assert_eq!(resource, "watchers");
                 assert_eq!(limit, 8);
             }
@@ -1018,7 +1061,9 @@ mod tests {
             .check_payload_size(OperationClass::FsWrite, max + 1)
             .is_err());
         // Classes without a payload ceiling accept anything.
-        assert!(rl.check_payload_size(OperationClass::Watcher, u64::MAX).is_ok());
+        assert!(rl
+            .check_payload_size(OperationClass::Watcher, u64::MAX)
+            .is_ok());
     }
 
     #[test]
@@ -1034,10 +1079,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind.code(), "resource_exhausted");
         rl.release_bytes(a);
-        assert_eq!(
-            rl.bytes_in_flight(device(1), OperationClass::SendBuffer),
-            0
-        );
+        assert_eq!(rl.bytes_in_flight(device(1), OperationClass::SendBuffer), 0);
         assert!(rl
             .reserve_bytes(device(2), OperationClass::SendBuffer, 5 * mib)
             .is_ok());

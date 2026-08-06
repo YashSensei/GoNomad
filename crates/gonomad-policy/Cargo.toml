@@ -20,6 +20,10 @@ dunce = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
+# Round-trip assertions for the types that reach the wire (DeviceGrant) and the
+# daemon's TOML/JSON config (DenylistConfig).
+ciborium = { workspace = true }
+serde_json = { workspace = true }
 
 [lints.rust]
 missing_docs = "warn"

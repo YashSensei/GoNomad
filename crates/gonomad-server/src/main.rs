@@ -168,6 +168,9 @@ async fn cmd_pair(paths: &state::Paths, workspace: Option<PathBuf>) -> Result<()
     println!("shown on your phone match the ones this machine displays.");
     println!();
     println!("Waiting for a device…  (Ctrl-C to cancel)");
+    println!();
+    println!("If nothing happens after scanning, it is almost certainly the local");
+    println!("firewall rather than the code — run `gonomad doctor` for the one-line fix.");
 
     let store = gonomad_store::Store::open(&paths.database)
         .context("could not open the device database")?;
@@ -452,15 +455,46 @@ fn cmd_doctor(paths: &state::Paths) {
         ok("network", &addrs.join(", "));
     }
 
-    warn(
+    ok(
         "transport",
-        "not implemented yet — pairing cannot complete in this build",
+        "LAN direct — TCP + Noise. NAT traversal (iroh) lands later",
     );
-    warn("mobile app", "not wired to the daemon yet");
 
     println!();
-    println!("No inbound port needs to be opened; GoNomad never asks you to");
-    println!("port-forward. See docs/deployment.md.");
+    print_firewall_note(gonomad_transport::DEFAULT_PORT);
+    println!();
+    println!("No router configuration and no port forwarding are ever needed.");
+    println!("See docs/deployment.md.");
+}
+
+/// Explains the local firewall, which is the first thing that actually blocks a
+/// phone on Windows.
+///
+/// Worth a dedicated note rather than a line in the docs: the daemon binds
+/// successfully, prints a QR, and reports itself healthy, while the phone's
+/// connection is dropped before the daemon ever sees it. Every symptom points at
+/// the app, and none points at the firewall. Detecting the rule reliably would
+/// mean parsing `netsh` output across locales, so the useful thing is to hand
+/// over the exact command instead.
+fn print_firewall_note(port: u16) {
+    #[cfg(windows)]
+    {
+        println!("Windows Firewall blocks inbound connections by default, and it will");
+        println!("silently drop your phone before the daemon sees it. Allow the port once,");
+        println!("from an Administrator PowerShell:");
+        println!();
+        println!("  New-NetFirewallRule -DisplayName 'GoNomad' -Direction Inbound `");
+        println!("    -Action Allow -Protocol TCP -LocalPort {port} -Profile Private");
+        println!();
+        println!("Private profile only, deliberately: that covers your home and office");
+        println!("networks and leaves the port closed on any network Windows considers");
+        println!("public, which is where you would least want it open.");
+    }
+    #[cfg(not(windows))]
+    {
+        println!("If a local firewall is active, allow inbound TCP on port {port} for your");
+        println!("local network only. GoNomad never needs an inbound rule at the router.");
+    }
 }
 
 /// Non-loopback IPv4 addresses, for the pairing ticket's hints.

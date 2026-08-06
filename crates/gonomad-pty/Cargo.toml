@@ -1,0 +1,31 @@
+[package]
+name = "gonomad-pty"
+description = "GoNomad terminals: ConPTY/PTY lifecycle with a daemon-side VT emulator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"

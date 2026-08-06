@@ -5,6 +5,8 @@ members = [
     "crates/gonomad-core",
     "crates/gonomad-store",
     "crates/gonomad-policy",
+    "crates/gonomad-transport",
+    "crates/gonomad-pty",
 ]
 
 # Crates added as milestones land (see plan.md):
@@ -30,6 +32,8 @@ gonomad-proto = { path = "crates/gonomad-proto", version = "0.0.1" }
 gonomad-core = { path = "crates/gonomad-core", version = "0.0.1" }
 gonomad-store = { path = "crates/gonomad-store", version = "0.0.1" }
 gonomad-policy = { path = "crates/gonomad-policy", version = "0.0.1" }
+gonomad-transport = { path = "crates/gonomad-transport", version = "0.0.1" }
+gonomad-pty = { path = "crates/gonomad-pty", version = "0.0.1" }
 
 # --- Serialization (ARCHITECTURE.md §10.3: CBOR for control frames) ---
 serde = { version = "1.0", features = ["derive"] }
@@ -73,6 +77,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # --- Filesystem (ARCHITECTURE.md §18.1) ---
 camino = "1.1"
 dunce = "1.0"
+
+# --- Terminal (ARCHITECTURE.md §8) ---
+# wezterm's PTY abstraction: the only mature cross-platform option with real
+# ConPTY support, which is decisive given Windows is the first-class host.
+portable-pty = "0.8"
+# Headless VT parser. The daemon holds the authoritative screen so the phone
+# receives bounded diffs rather than an unbounded byte stream (§8.3).
+vt100 = "0.15"
 
 # --- Utilities ---
 hex = "0.4"

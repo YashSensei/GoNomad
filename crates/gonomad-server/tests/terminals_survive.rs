@@ -148,7 +148,8 @@ async fn daemon_for(
             };
             let peer = conn.peer_key();
             let services = Arc::clone(&services);
-            let grant = grant.clone();
+            // DeviceGrant is Copy, so each connection gets its own by value.
+            let grant = grant;
             tokio::spawn(async move {
                 let mut router = gonomad_server::router::Router::established(services, peer, grant);
                 let Ok((mut tx, mut rx)) = conn.accept_bi().await else {

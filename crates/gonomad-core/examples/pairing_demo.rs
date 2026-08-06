@@ -18,17 +18,35 @@
 //! trusted before there is anything to connect.
 
 use gonomad_core::pairing::{ManualCode, PairingWindow};
-use gonomad_core::{DeviceIdentity, Handshake, PairingSecret, PairingTicket, Purpose};
+use gonomad_core::{DeviceIdentity, Handshake, PairingSecret, PairingTicket, Purpose, Session};
+
+/// Scratch buffer size. Generous: handshake messages are under 100 bytes.
+const BUF: usize = 4096;
 
 fn main() {
     println!("GoNomad pairing demonstration");
     println!("=============================\n");
     println!("Both peers run in this process. There is no network yet.\n");
 
-    // ---- 1. The laptop generates its identity ------------------------------
-    // In the real daemon this is created once by `gonomad init` and stored in
-    // the OS keyring, never in a file.
     let daemon = DeviceIdentity::generate();
+    show_identity(&daemon);
+
+    let secret = PairingSecret::generate();
+    let qr_payload = open_pairing_window(&daemon, &secret);
+
+    let (scanned, scanned_secret) = scan_qr(&qr_payload, &daemon);
+    let (phone_session, laptop_session) =
+        run_handshake(&daemon, &scanned, &scanned_secret, &secret);
+
+    exchange_a_request(phone_session, laptop_session);
+
+    println!("Done. Every step above ran the real implementation.");
+    println!("Still missing: the transport, the daemon, and the Android app.");
+}
+
+/// Step 1 — the identity `gonomad init` would create once and keep in the OS
+/// keyring, never in a file.
+fn show_identity(daemon: &DeviceIdentity) {
     println!("1. Laptop identity");
     println!("   device id      {}", daemon.device_id());
     println!(
@@ -39,48 +57,58 @@ fn main() {
         "   noise key      {}  (X25519, authenticates the session)\n",
         daemon.noise_public_key().short()
     );
-    assert_ne!(
-        daemon.public_key(),
-        daemon.noise_public_key(),
-        "these are different keys; see identity.rs"
-    );
 
-    // ---- 2. `gonomad pair` opens a 120-second window -----------------------
-    let secret = PairingSecret::generate();
+    // These are deliberately different keys. Conflating them was a real bug.
+    assert_ne!(daemon.public_key(), daemon.noise_public_key());
+}
+
+/// Step 2 — what `gonomad pair` puts on screen.
+fn open_pairing_window(daemon: &DeviceIdentity, secret: &PairingSecret) -> String {
     let ticket = PairingTicket {
         daemon_key: daemon.noise_public_key(),
         addr_hints: vec!["192.168.1.42:41234".into()],
         relay_hint: Some("https://relay.example.com".into()),
     };
-    let qr_payload = ticket.encode(&secret);
-    let manual = ManualCode::from_secret(&secret);
-    let mut window = PairingWindow::open(0);
+    let payload = ticket.encode(secret);
 
     println!("2. Laptop runs `gonomad pair`");
-    println!("   QR payload     {qr_payload}");
+    println!("   QR payload     {payload}");
     println!(
         "   ({} chars, uppercase base32 for QR alphanumeric mode)",
-        qr_payload.len()
+        payload.len()
     );
-    println!("   manual code    {manual}   (fallback if the camera is broken)");
     println!(
-        "   window         120s, single use, {} attempts\n",
-        window.attempts_remaining()
+        "   manual code    {}   (fallback if the camera is broken)",
+        ManualCode::from_secret(secret)
     );
+    let attempts = gonomad_core::MAX_PAIRING_ATTEMPTS;
+    println!("   window         120s, single use, {attempts} attempts\n");
 
-    // ---- 3. The phone scans the QR -----------------------------------------
-    let (scanned, scanned_secret) =
-        PairingTicket::decode(&qr_payload).expect("the phone decodes the QR");
+    payload
+}
+
+/// Step 3 — the phone decodes the QR and learns the laptop's authentic key over
+/// an optical channel. That is what defeats a network man-in-the-middle.
+fn scan_qr(payload: &str, daemon: &DeviceIdentity) -> (PairingTicket, PairingSecret) {
+    let (scanned, secret) = PairingTicket::decode(payload).expect("the phone decodes the QR");
+
     println!("3. Phone scans the QR");
     println!("   daemon key     {}", scanned.daemon_key.short());
     println!("   addr hints     {:?}", scanned.addr_hints);
     println!("   relay hint     {:?}\n", scanned.relay_hint);
+
     assert_eq!(scanned.daemon_key, daemon.noise_public_key());
+    (scanned, secret)
+}
 
-    // The phone now knows the laptop's authentic public key, learned over an
-    // optical channel. That is what defeats a network man-in-the-middle.
-
-    // ---- 4. The Noise IKpsk2 handshake -------------------------------------
+/// Steps 4 and 5 — the Noise IKpsk2 handshake and the SAS comparison.
+fn run_handshake(
+    daemon: &DeviceIdentity,
+    scanned: &PairingTicket,
+    scanned_secret: &PairingSecret,
+    laptop_secret: &PairingSecret,
+) -> (Session, Session) {
+    let mut window = PairingWindow::open(0);
     window.try_attempt(0).expect("within the pairing window");
 
     let phone = DeviceIdentity::generate();
@@ -89,10 +117,11 @@ fn main() {
     let mut initiator =
         Handshake::initiator(&phone, &scanned.daemon_key, Purpose::Pairing, Some(&psk))
             .expect("initiator");
-    let mut responder = Handshake::responder(&daemon, Purpose::Pairing, Some(secret.as_bytes()))
-        .expect("responder");
+    let mut responder =
+        Handshake::responder(daemon, Purpose::Pairing, Some(laptop_secret.as_bytes()))
+            .expect("responder");
 
-    let mut msg1 = vec![0u8; 4096];
+    let mut msg1 = vec![0u8; BUF];
     let n1 = initiator
         .write_message(&[], &mut msg1)
         .expect("first flight");
@@ -102,15 +131,15 @@ fn main() {
     let phone_key = phone.noise_public_key();
     assert!(
         !msg1[..n1].windows(32).any(|w| w == phone_key.as_bytes()),
-        "the initiator's identity must not be in the clear"
+        "the initiator's identity must not travel in the clear"
     );
 
-    let mut scratch = vec![0u8; 4096];
+    let mut scratch = vec![0u8; BUF];
     responder
         .read_message(&msg1[..n1], &mut scratch)
         .expect("laptop reads");
 
-    let mut msg2 = vec![0u8; 4096];
+    let mut msg2 = vec![0u8; BUF];
     let n2 = responder
         .write_message(&[], &mut msg2)
         .expect("second flight");
@@ -123,7 +152,6 @@ fn main() {
     println!("   laptop -> phone  {n2} bytes");
     println!("   complete in one round trip\n");
 
-    // ---- 5. Both sides derive the SAS independently ------------------------
     let phone_sas = initiator.sas().expect("phone SAS");
     let laptop_sas = responder.sas().expect("laptop SAS");
 
@@ -138,10 +166,10 @@ fn main() {
             "NO -> refuse"
         }
     );
-    assert_eq!(phone_sas, laptop_sas);
 
-    // A man-in-the-middle proxying this connection produces a different
-    // transcript on each side, so these digits would disagree.
+    // A man-in-the-middle proxying this produces a different transcript on each
+    // side, so these digits would disagree and the human would see it.
+    assert_eq!(phone_sas, laptop_sas);
 
     window.consume();
     println!(
@@ -149,18 +177,21 @@ fn main() {
         window.try_attempt(0).unwrap_err()
     );
 
-    // ---- 6. Encrypted traffic ----------------------------------------------
-    let mut phone_session = initiator.into_session().expect("phone session");
-    let mut laptop_session = responder.into_session().expect("laptop session");
+    (
+        initiator.into_session().expect("phone"),
+        responder.into_session().expect("laptop"),
+    )
+}
 
+/// Step 6 — one encrypted request, and a rejected replay.
+fn exchange_a_request(mut phone: Session, mut laptop: Session) {
     let request = b"fs.read src/main.rs";
-    let mut ciphertext = vec![0u8; 4096];
-    let n = phone_session
-        .encrypt(request, &mut ciphertext)
-        .expect("encrypt");
 
-    let mut plaintext = vec![0u8; 4096];
-    let m = laptop_session
+    let mut ciphertext = vec![0u8; BUF];
+    let n = phone.encrypt(request, &mut ciphertext).expect("encrypt");
+
+    let mut plaintext = vec![0u8; BUF];
+    let m = laptop
         .decrypt(&ciphertext[..n], &mut plaintext)
         .expect("decrypt");
 
@@ -174,16 +205,14 @@ fn main() {
         "   laptop reads   {:?}",
         String::from_utf8_lossy(&plaintext[..m])
     );
+
     assert_eq!(&plaintext[..m], request);
     assert!(
         !ciphertext[..n].windows(request.len()).any(|w| w == request),
         "plaintext must not appear on the wire"
     );
 
-    // Replaying the identical ciphertext is rejected by Noise's nonce counter.
-    let replayed = laptop_session.decrypt(&ciphertext[..n], &mut plaintext);
+    // Noise's per-message nonce counter makes in-session replay impossible.
+    let replayed = laptop.decrypt(&ciphertext[..n], &mut plaintext);
     println!("   replay         rejected: {}\n", replayed.unwrap_err());
-
-    println!("Done. Every step above ran the real implementation.");
-    println!("Still missing: the transport, the daemon, and the Android app.");
 }

@@ -12,11 +12,11 @@ authors.workspace = true
 gonomad-proto = { workspace = true }
 gonomad-core = { workspace = true }
 tokio = { workspace = true }
-futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-serde = { workspace = true }
-ciborium = { workspace = true }
+# The pairing PSK is held in a wiping buffer for as long as a server config
+# lives, which can be the whole 120-second pairing window (ARCHITECTURE.md §9).
+zeroize = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

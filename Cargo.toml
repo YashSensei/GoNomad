@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/gonomad-proto",
+    "crates/gonomad-store",
+    "crates/gonomad-policy",
 ]
 
 # Crates added as milestones land (see plan.md):

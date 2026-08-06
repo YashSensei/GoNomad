@@ -1,0 +1,27 @@
+# Normalise line endings so the repo is byte-identical across platforms.
+# GoNomad is developed on Windows and Unix simultaneously; without this,
+# every checkout churns and reproducible builds (ARCHITECTURE.md §24.12) break.
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF or cmd/PowerShell may misparse them.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binary — never touch.
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
+*.keystore binary
+*.apk  binary
+*.aab  binary
+*.so   binary
+*.dll  binary
+*.jar  binary
+
+# Generated / vendored: collapse in diffs and exclude from language stats.
+Cargo.lock            linguist-generated=true
+editor/package-lock.json linguist-generated=true
+docs/**               linguist-documentation=true

@@ -44,6 +44,25 @@
 //! choose which pattern to run would let an attacker ask for the pairing
 //! pattern whenever it liked.
 //!
+//! # A wrong pairing secret is detected by the phone, not by the daemon
+//!
+//! Worth stating because it looks like a hole and is not one. In `IKpsk2` the
+//! pre-shared key is mixed into the **second** message — the one the responder
+//! writes — so the responder cannot tell a wrong PSK from a right one. It
+//! completes its side and produces a session; the initiator's AEAD check then
+//! fails and it aborts.
+//!
+//! The consequence is that a daemon in a pairing window can be made to hold a
+//! short-lived, useless session by anyone who can reach the port: useless
+//! because the two sides derived different keys, so the very first record fails
+//! to decrypt and the connection is torn down with
+//! [`TransportError::Crypto`]. What must **not** happen is a device being
+//! registered on the strength of a completed handshake alone. Registration is
+//! the caller's job and must wait for an authenticated application exchange over
+//! the control stream — which is impossible to fake, precisely because the keys
+//! disagree. The three-attempt cap and the 120-second window
+//! (`gonomad_core::PairingWindow`) bound the attempt rate.
+//!
 //! # After the handshake, nothing is plaintext
 //!
 //! Every subsequent byte is a Noise-sealed record (see [`crate::mux`]). The only

@@ -429,7 +429,11 @@ impl Shared {
             });
         }
         let pair = self.insert_channel(&mut inner, id);
-        inner.out.entry(id).or_default().push_back(Segment::open(id));
+        inner
+            .out
+            .entry(id)
+            .or_default()
+            .push_back(Segment::open(id));
         drop(inner);
         self.notify.notify_one();
         Ok(pair)
@@ -1444,11 +1448,11 @@ mod tests {
                     channels: BTreeMap::new(),
                     retired: BTreeSet::new(),
                     retired_order: VecDeque::new(),
+                    accept_tx: Some(mpsc::unbounded_channel().0),
                     closed: false,
                     close_err: None,
                 }),
                 notify: Notify::new(),
-                accept_tx: mpsc::unbounded_channel().0,
                 next_local: AtomicU32::new(1),
             });
             let _ = handle_segment(&shared, &bytes);

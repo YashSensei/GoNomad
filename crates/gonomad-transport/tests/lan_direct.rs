@@ -75,10 +75,10 @@ async fn dial(
 
 /// Awaits `future`, failing the test rather than hanging if it stalls.
 async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
-    match tokio::time::timeout(PATIENCE, future).await {
-        Ok(value) => value,
-        Err(_) => panic!("{what} did not finish within {PATIENCE:?}"),
-    }
+    let Ok(value) = tokio::time::timeout(PATIENCE, future).await else {
+        panic!("{what} did not finish within {PATIENCE:?}")
+    };
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -91,9 +91,13 @@ async fn a_paired_device_reconnects_and_exchanges_frames_both_ways() {
     let phone = identity();
     let server = bind_reconnect(&daemon, vec![phone.noise_public_key()]).await;
 
-    let client_conn = dial(ClientConfig::reconnect(Arc::clone(&phone)), &daemon, &server)
-        .await
-        .expect("reconnect");
+    let client_conn = dial(
+        ClientConfig::reconnect(Arc::clone(&phone)),
+        &daemon,
+        &server,
+    )
+    .await
+    .expect("reconnect");
     let server_conn = within("accept", server.accept_lan()).await.expect("accept");
 
     // Each side authenticated the other's Noise static key, which is the whole
@@ -116,7 +120,9 @@ async fn a_paired_device_reconnects_and_exchanges_frames_both_ways() {
         .expect("frame");
     assert_eq!(got.payload, b"fs.read src/main.rs");
 
-    stx.send(&frame(b"fn main() {}")).await.expect("server send");
+    stx.send(&frame(b"fn main() {}"))
+        .await
+        .expect("server send");
     let back = within("client recv", crx.recv())
         .await
         .expect("recv")
@@ -179,6 +185,20 @@ async fn pairing_with_the_wrong_secret_is_refused() {
     )
     .await;
     assert_eq!(result.err(), Some(TransportError::HandshakeFailed));
+
+    // IKpsk2 mixes the secret into the responder's message, so the daemon
+    // cannot detect the mismatch and may hold a half-open session (see the
+    // `tcp` module docs). It must be unusable: the keys disagree, so the first
+    // record fails to authenticate.
+    if let Ok(Ok(conn)) =
+        tokio::time::timeout(Duration::from_millis(300), server.accept_lan()).await
+    {
+        let outcome = within("recv on a mismatched session", conn.accept_bi()).await;
+        assert!(
+            outcome.is_err(),
+            "a session built on a mismatched PSK must carry no data"
+        );
+    }
 }
 
 #[tokio::test]
@@ -207,9 +227,13 @@ async fn an_unpaired_device_is_dropped_before_it_learns_anything() {
     );
 
     // The listener is still healthy afterwards.
-    dial(ClientConfig::reconnect(Arc::clone(&paired)), &daemon, &server)
-        .await
-        .expect("a paired device still connects");
+    dial(
+        ClientConfig::reconnect(Arc::clone(&paired)),
+        &daemon,
+        &server,
+    )
+    .await
+    .expect("a paired device still connects");
 }
 
 #[tokio::test]
@@ -220,8 +244,7 @@ async fn dialling_the_wrong_daemon_key_fails() {
     let phone = identity();
     let server = bind_reconnect(&daemon, vec![phone.noise_public_key()]).await;
 
-    let client =
-        TcpTransport::client(ClientConfig::reconnect(Arc::clone(&phone))).expect("client");
+    let client = TcpTransport::client(ClientConfig::reconnect(Arc::clone(&phone))).expect("client");
     let peer = PeerId::from_noise_key(impostor.noise_public_key());
     let hints = [AddrHint::Direct(server.local_addr().expect("bound"))];
     assert!(client.connect_lan(peer, &hints).await.is_err());
@@ -232,9 +255,13 @@ async fn a_lan_connection_reports_tier_zero_and_measures_its_round_trip() {
     let daemon = identity();
     let phone = identity();
     let server = bind_reconnect(&daemon, vec![phone.noise_public_key()]).await;
-    let conn = dial(ClientConfig::reconnect(Arc::clone(&phone)), &daemon, &server)
-        .await
-        .expect("connect");
+    let conn = dial(
+        ClientConfig::reconnect(Arc::clone(&phone)),
+        &daemon,
+        &server,
+    )
+    .await
+    .expect("connect");
 
     let info = conn.path_info();
     assert_eq!(info.tier, gonomad_transport::Tier::Lan);
@@ -259,60 +286,85 @@ async fn a_large_transfer_cannot_starve_the_control_channel() {
     let phone = identity();
     let server = bind_reconnect(&daemon, vec![phone.noise_public_key()]).await;
 
-    let client_conn = dial(ClientConfig::reconnect(Arc::clone(&phone)), &daemon, &server)
-        .await
-        .expect("connect");
+    let client_conn = dial(
+        ClientConfig::reconnect(Arc::clone(&phone)),
+        &daemon,
+        &server,
+    )
+    .await
+    .expect("connect");
     let server_conn = within("accept", server.accept_lan()).await.expect("accept");
 
     let (mut control_tx, mut control_rx) = client_conn.open_bi().expect("control");
     let (mut bulk_tx, _bulk_rx) = client_conn.open_bi().expect("bulk");
     assert_eq!(control_tx.id(), CONTROL_CHANNEL);
+    assert_ne!(bulk_tx.id(), CONTROL_CHANNEL);
 
-    // Daemon side: echo on control, crawl on bulk.
-    let (_, mut server_control_rx) = within("accept control", server_conn.accept_bi())
+    // Channels arrive in the order they were opened.
+    let (mut server_control_tx, mut server_control_rx) =
+        within("accept control", server_conn.accept_bi())
+            .await
+            .expect("accept control");
+    let (_server_bulk_tx, mut server_bulk_rx) = within("accept bulk", server_conn.accept_bi())
         .await
-        .expect("accept control");
-    let mut server_control_tx = {
-        let (tx, _rx) = within("accept control pair", async { Ok::<_, ()>(()) })
-            .await
-            .map(|()| (None::<()>, ()))
-            .expect("placeholder");
-        drop(tx);
-        // The send half of the control channel comes from the same accept.
-        None::<()>
-    };
-    drop(server_control_tx.take());
+        .expect("accept bulk");
+    assert_eq!(server_control_tx.id(), CONTROL_CHANNEL);
 
-    let (mut server_control_send, mut server_bulk_rx) = {
-        // The first accept above gave us the control channel's halves split
-        // across two bindings; re-accept the bulk channel here.
-        let (_, bulk_rx) = within("accept bulk", server_conn.accept_bi())
-            .await
-            .expect("accept bulk");
-        (None::<()>, bulk_rx)
-    };
-    drop(server_control_send.take());
+    // The daemon echoes control frames immediately...
+    let echo = tokio::spawn(async move {
+        while let Ok(Some(got)) = server_control_rx.recv().await {
+            if server_control_tx.send(&got).await.is_err() {
+                break;
+            }
+        }
+    });
 
+    // ...and drains the bulk channel at a crawl. Because credit is only
+    // returned when a frame is consumed, this parks the client's bulk sender
+    // for most of the test.
     let bulk_reader = tokio::spawn(async move {
         let mut seen = 0usize;
-        while let Ok(Some(_frame)) = server_bulk_rx.recv().await {
+        while let Ok(Some(_got)) = server_bulk_rx.recv().await {
             seen += 1;
-            // Slow consumer: credit only comes back this often.
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         seen
     });
 
-    let echo = tokio::spawn(async move {
-        while let Ok(Some(_f)) = server_control_rx.recv().await {
-            // Echoing needs the send half, obtained below via the connection.
+    let payload = vec![0x5Au8; 200_000];
+    let bulk_sender = tokio::spawn(async move {
+        for _ in 0..40 {
+            if bulk_tx.send(&frame(&payload)).await.is_err() {
+                break;
+            }
         }
     });
-    drop(echo);
-    drop(bulk_reader);
-    drop(control_rx.recv());
-    drop(control_tx.send(&frame(b"x")).await);
-    drop(bulk_tx.send(&frame(b"y")).await);
+
+    // Ten control round trips, while roughly 8 MB is queued behind a consumer
+    // that accepts 200 KB every 50 ms.
+    let started = Instant::now();
+    for i in 0..10u8 {
+        control_tx.send(&frame(&[i])).await.expect("control send");
+        let echoed = within("control echo", control_rx.recv())
+            .await
+            .expect("recv")
+            .expect("frame");
+        assert_eq!(echoed.payload, vec![i]);
+    }
+    let control_time = started.elapsed();
+
+    assert!(
+        !bulk_sender.is_finished(),
+        "the bulk transfer finished too quickly for this test to prove anything"
+    );
+    assert!(
+        control_time < Duration::from_secs(3),
+        "control traffic was starved by the bulk transfer: {control_time:?} for 10 round trips"
+    );
+
+    bulk_sender.abort();
+    bulk_reader.abort();
+    echo.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -428,9 +480,13 @@ async fn a_clean_disconnect_ends_the_stream_without_an_error() {
     let phone = identity();
     let server = bind_reconnect(&daemon, vec![phone.noise_public_key()]).await;
 
-    let client_conn = dial(ClientConfig::reconnect(Arc::clone(&phone)), &daemon, &server)
-        .await
-        .expect("connect");
+    let client_conn = dial(
+        ClientConfig::reconnect(Arc::clone(&phone)),
+        &daemon,
+        &server,
+    )
+    .await
+    .expect("connect");
     let (mut tx, _rx) = client_conn.open_bi().expect("open");
     tx.send(&frame(b"bye")).await.expect("send");
 
@@ -476,9 +532,13 @@ async fn garbage_before_the_handshake_does_not_disturb_the_listener() {
         drop(sock);
     }
 
-    dial(ClientConfig::reconnect(Arc::clone(&phone)), &daemon, &server)
-        .await
-        .expect("the listener still works after being probed");
+    dial(
+        ClientConfig::reconnect(Arc::clone(&phone)),
+        &daemon,
+        &server,
+    )
+    .await
+    .expect("the listener still works after being probed");
 }
 
 #[tokio::test]
@@ -595,9 +655,13 @@ async fn a_multi_megabyte_transfer_arrives_intact() {
     let phone = identity();
     let server = bind_reconnect(&daemon, vec![phone.noise_public_key()]).await;
 
-    let client_conn = dial(ClientConfig::reconnect(Arc::clone(&phone)), &daemon, &server)
-        .await
-        .expect("connect");
+    let client_conn = dial(
+        ClientConfig::reconnect(Arc::clone(&phone)),
+        &daemon,
+        &server,
+    )
+    .await
+    .expect("connect");
     let server_conn = within("accept", server.accept_lan()).await.expect("accept");
 
     let chunk: Vec<u8> = (0..=255u8).cycle().take(200_000).collect();

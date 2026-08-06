@@ -1,0 +1,221 @@
+name: Bug report
+description: Something behaves differently from how it is documented or intended.
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file this.
+
+        **GoNomad is pre-release.** Milestone M1 (transport, pairing, security
+        foundation) is in progress and most of the product does not exist yet —
+        see [`plan.md`](https://github.com/YashSensei/GoNomad/blob/main/plan.md).
+        A report that something is missing is usually a roadmap question rather
+        than a bug; a report that something present behaves wrongly is exactly
+        what this form is for.
+
+  # -------------------------------------------------------------------
+  # The security gate comes first, before the reporter has invested any
+  # effort in writing up details that should not be public.
+  # -------------------------------------------------------------------
+  - type: checkboxes
+    id: not-a-vulnerability
+    attributes:
+      label: Security check
+      description: >-
+        GoNomad holds device keypairs and mediates access to your filesystem,
+        terminals, and git credentials. A vulnerability filed publicly is
+        disclosed to attackers before it is fixed.
+      options:
+        - label: >-
+            This is **not** a security vulnerability. If it is — anything
+            involving authentication bypass, capability escalation, path-guard
+            escape, key exposure, pairing/SAS weaknesses, or the audit log —
+            I will close this and instead use
+            [private advisory reporting](https://github.com/YashSensei/GoNomad/security/advisories/new)
+            or the process in `SECURITY.md`.
+          required: true
+
+  - type: checkboxes
+    id: prior-art
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: >-
+            I checked `plan.md` and this is not simply a feature scheduled for
+            a later milestone or on the explicit not-in-MVP list.
+          required: false
+
+  # -------------------------------------------------------------------
+  # Environment
+  # -------------------------------------------------------------------
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component?
+      description: >-
+        The daemon is the Rust process on your development machine. The Android
+        app is the phone client. "Both / unsure" is a fine answer for anything
+        that only shows up over the wire.
+      options:
+        - Daemon / CLI (the machine being reached)
+        - Android app (the phone)
+        - Both, or unsure which side is at fault
+        - Build, tests, or CI
+        - Documentation
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host-os
+    attributes:
+      label: Host operating system
+      description: >-
+        Windows is the first-class host. macOS and Linux hosts are scheduled
+        for M6 and are not expected to work yet.
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Not applicable (Android-only, or docs)
+    validations:
+      required: true
+
+  - type: input
+    id: host-os-version
+    attributes:
+      label: Host OS version
+      description: >-
+        Be specific — Windows behaviour differs across builds. On Windows run
+        `cmd /c ver` or check Settings → System → About → OS build. On Linux
+        paste `uname -a` plus your distribution and version.
+      placeholder: "Windows 11 26H1, build 26200.1234"
+    validations:
+      required: true
+
+  - type: input
+    id: shell
+    attributes:
+      label: Shell and terminal (if the bug involves a terminal)
+      description: >-
+        Which shell the daemon spawned, and its version. ConPTY behaviour
+        differs meaningfully between PowerShell 5.1, pwsh 7, cmd, and WSL.
+      placeholder: "pwsh 7.4.6 — or: WSL2 Ubuntu 24.04, bash 5.2"
+    validations:
+      required: false
+
+  - type: input
+    id: gonomad-version
+    attributes:
+      label: GoNomad version
+      description: >-
+        Output of `gonomad --version` once the CLI exists. Until then, the
+        commit SHA you built from. "main @ <sha>" is fine.
+      placeholder: "main @ a1b2c3d, built 2026-08-06"
+    validations:
+      required: true
+
+  - type: input
+    id: android-version
+    attributes:
+      label: Android device and OS version
+      description: >-
+        Only if the Android app is involved. Include the manufacturer — OEM
+        battery managers (Xiaomi, Samsung, OnePlus, Huawei) cause connection
+        drops that are unreproducible on a Pixel.
+      placeholder: "Pixel 8, Android 15 — or: Xiaomi 14, HyperOS 2.0"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: transport-tier
+    attributes:
+      label: Transport tier in use
+      description: >-
+        The status chip in the app shows this. A bug that only reproduces over
+        a relay is a completely different bug from one that also happens on
+        LAN, and knowing which halves the search space.
+      options:
+        - Tier 0 — LAN direct (same network, mDNS)
+        - Tier 1 — direct P2P (hole-punched, remote)
+        - Tier 2 — relay (CGNAT / symmetric NAT / restrictive firewall)
+        - Tier 3 — Tailscale, Cloudflare Tunnel, or SSH forwarding
+        - Offline / never connected
+        - Not applicable, or unknown
+    validations:
+      required: true
+
+  - type: input
+    id: network
+    attributes:
+      label: Network conditions
+      description: >-
+        Relevant when the bug is about connectivity, latency, or reconnection.
+      placeholder: "Phone on LTE, laptop on home Wi-Fi behind CGNAT"
+    validations:
+      required: false
+
+  # -------------------------------------------------------------------
+  # The bug itself
+  # -------------------------------------------------------------------
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you observed, in one or two sentences.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+      description: >-
+        If the expectation comes from `ARCHITECTURE.md` or `plan.md`, quoting
+        the section makes this unarguable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        Numbered, from a known starting state. A reproduction that starts from
+        `gonomad init` on a clean machine is worth ten that start from "my
+        setup". Note whether it reproduces every time or intermittently.
+      value: |
+        1.
+        2.
+        3.
+
+        Reproducibility: (always / often / once)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Daemon logs, `gonomad doctor` output, or `adb logcat` from the phone.
+        **Redact before pasting** — logs from a dev machine routinely contain
+        absolute paths, hostnames, repository names, and environment variables.
+        Never paste a recovery phrase, a private key, or a pairing QR payload.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: >-
+        Screenshots, a screen recording, a workaround you found, or the commit
+        where it started working differently.
+    validations:
+      required: false

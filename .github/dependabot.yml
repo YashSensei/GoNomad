@@ -1,0 +1,74 @@
+# Dependabot configuration.
+#
+# Two ecosystems, because two exist: the Cargo workspace and the GitHub Actions
+# used by the workflows in this directory. Ecosystems for Gradle (Android, M1)
+# and npm (the CodeMirror `editor/` bundle, M3) get added when those directories
+# actually exist — Dependabot logs a repository-level error for a configured
+# directory it cannot find.
+#
+# Note for reviewers: Dependabot commits are not DCO-signed (plan.md locks
+# Apache-2.0 + DCO). Until a DCO bot is configured, a maintainer merging one of
+# these should squash-merge with a signed-off commit message.
+
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------
+  # Rust
+  # ---------------------------------------------------------------------
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    # Deliberately low. ARCHITECTURE.md §3.11 requires every dependency change
+    # to be justified in review; a queue of 20 open PRs guarantees that stops
+    # happening. If the cap is hit regularly, the dependency set is too large.
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      include: scope
+    labels:
+      - dependencies
+    groups:
+      # One PR per week for the boring updates. Ungrouped, a three-crate
+      # workspace still produces a handful of PRs a week and they stop being
+      # read. Majors stay ungrouped so each gets its own review.
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # No `ignore:` block. Anything added here must carry a reason inline —
+    # a silently pinned-back dependency is how a known-vulnerable version
+    # survives an advisory scan.
+
+  # ---------------------------------------------------------------------
+  # GitHub Actions
+  # ---------------------------------------------------------------------
+  # The workflows pin third-party actions to full commit SHAs. Dependabot
+  # understands SHA pins: it bumps the SHA and rewrites the trailing
+  # `# vX.Y.Z` comment, so pinning costs nothing in maintenance.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: scope
+    labels:
+      - dependencies
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

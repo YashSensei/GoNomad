@@ -1,0 +1,188 @@
+name: CI
+
+# The main correctness gate. Every job here is blocking.
+#
+# Scope note: this workflow deliberately covers only the Rust workspace, because
+# that is all that exists today (see plan.md — M1 is in progress). Android,
+# the CodeMirror `editor/` bundle, benchmarks and release signing get their own
+# jobs when their milestones land; a job that references a directory which does
+# not exist yet is worse than no job at all. See docs/ci.md for the planned set.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Lets a maintainer re-run the gate without pushing an empty commit.
+  workflow_dispatch:
+
+# Least privilege, set explicitly rather than inherited from the repository
+# default (which may be read/write). Nothing in this workflow writes to the
+# repository, comments on a PR, or publishes anything, so `contents: read` is
+# the whole requirement. Any future job that needs more should request it at
+# the *job* level, not here.
+permissions:
+  contents: read
+
+concurrency:
+  # One in-flight run per branch / PR.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded PR runs are cancelled: a force-push makes the previous result
+  # meaningless. Runs on `main` are NOT cancelled, so every commit on the
+  # default branch keeps a real, attributable status.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are errors everywhere, not just under clippy. This catches
+  # `unused_imports` and friends in the plain `cargo test` / `cargo doc` builds
+  # too. Registry dependencies are compiled with `--cap-lints allow`, so this
+  # only escalates warnings in our own crates.
+  RUSTFLAGS: -D warnings
+  # Incremental artefacts are large, are never reused across CI runs, and only
+  # bloat the cache. Off is both faster and smaller here.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    # Single runner on purpose: rustfmt's output does not vary by host OS, so a
+    # matrix here would burn minutes to assert the same thing twice.
+    runs-on: ubuntu-latest
+    steps:
+      # First-party GitHub action, pinned to a major tag. Anthropic-style SHA
+      # pinning is applied to third-party actions below; `actions/*` is
+      # published by GitHub itself from the same trust boundary as the runner.
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        # No toolchain argument: rustup reads rust-toolchain.toml, which is the
+        # single source of truth for channel, components and targets
+        # (ARCHITECTURE.md §24.12). Never name a toolchain here — that would
+        # let CI and developer machines drift apart.
+        run: rustup toolchain install --no-self-update
+
+      - name: Check formatting
+        # `cargo fmt` takes no --locked: it does not resolve dependencies.
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A Windows-only failure must not hide a Linux-only failure, and vice
+      # versa. Both results are wanted on every run.
+      fail-fast: false
+      matrix:
+        # windows-latest is listed first because Windows is the first-class
+        # host (plan.md, "Locked decisions"): ConPTY handles, UNC and `\\?\`
+        # paths, and case-insensitive filesystems only misbehave here.
+        # ubuntu-latest keeps the codebase honest for the macOS/Linux hosts
+        # that land at M6.
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: rustup toolchain install --no-self-update
+
+      # Third-party action, pinned to a full commit SHA rather than a tag: a
+      # mutable tag can be repointed at new code by anyone who can push to that
+      # repository, which is a supply-chain hole in exactly the class this
+      # project is meant to close (ARCHITECTURE.md §3.11). The trailing comment
+      # records the human-readable version so Dependabot can bump it.
+      - name: Cache cargo registry, git checkouts and target/
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Keyed per-OS so a Windows target/ directory never restores over a
+          # Linux one. rust-cache also folds in the rustc version and the
+          # lockfile hash automatically.
+          key: ${{ matrix.os }}
+          # A failed build still produced useful dependency artefacts; saving
+          # them makes the fix-up push fast.
+          cache-on-failure: true
+
+      - name: Clippy
+        # --all-targets covers tests, examples and benches, not just the lib.
+        # --locked makes a stale Cargo.lock a build failure instead of a silent
+        # dependency upgrade (ARCHITECTURE.md §24.12).
+        run: cargo clippy --all-targets --workspace --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: rustup toolchain install --no-self-update
+
+      - name: Cache cargo registry, git checkouts and target/
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  docs:
+    name: rustdoc (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Documented on both hosts because `#[cfg(windows)]` and `#[cfg(unix)]`
+        # items are only compiled — and only link-checked — on their own
+        # platform.
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        run: rustup toolchain install --no-self-update
+
+      - name: Cache cargo registry, git checkouts and target/
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Build documentation
+        env:
+          # Turns a broken intra-doc link into a build failure. Docs that lie
+          # about where a type lives are worse than no docs, and rustdoc's
+          # link resolution is the only thing that can catch it.
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --workspace --locked
+
+  # A single job to point branch protection at, so adding or renaming a matrix
+  # leg does not require editing the repository's required-checks list.
+  ci-success:
+    name: CI success
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, docs]
+    # `always()` so this job still runs (and fails) when a dependency fails or
+    # is skipped, rather than being skipped itself — a skipped required check
+    # is reported as passing by branch protection.
+    if: always()
+    steps:
+      - name: Verify that every required job succeeded
+        run: |
+          echo "fmt=${{ needs.fmt.result }}"
+          echo "clippy=${{ needs.clippy.result }}"
+          echo "test=${{ needs.test.result }}"
+          echo "docs=${{ needs.docs.result }}"
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "true" ]; then
+            echo "::error::One or more required CI jobs did not succeed."
+            exit 1
+          fi

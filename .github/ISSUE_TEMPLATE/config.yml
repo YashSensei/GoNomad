@@ -1,0 +1,30 @@
+# Issue chooser configuration.
+
+# Blank issues are disabled so that every report arrives with the host OS,
+# component and transport tier already filled in. Chasing that information
+# across three comment round-trips is the single largest cost of triaging a
+# distributed system's bug reports.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/YashSensei/GoNomad/security/advisories/new
+    about: >-
+      GoNomad is a security tool: it holds device keys and mediates access to a
+      developer's filesystem, terminals and git credentials. Never open a public
+      issue for a vulnerability. Use GitHub's private advisory form here, or
+      follow SECURITY.md. You will get a coordinated fix and credit.
+
+  - name: Question, idea, or "is this supposed to work?"
+    url: https://github.com/YashSensei/GoNomad/discussions
+    about: >-
+      Usage questions, setup help, architecture discussion and half-formed
+      feature ideas belong in Discussions. Issues are for confirmed bugs and
+      accepted, scoped work.
+
+  - name: Architecture and roadmap
+    url: https://github.com/YashSensei/GoNomad/blob/main/ARCHITECTURE.md
+    about: >-
+      Before filing, check whether the behaviour is a deliberate decision.
+      ARCHITECTURE.md records the "why" and plan.md records what is scheduled
+      for which milestone, including an explicit not-in-MVP list.

@@ -1,0 +1,138 @@
+name: Feature request
+description: Propose a capability GoNomad does not have.
+title: "[feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        GoNomad's scope is written down precisely so that scope creep has to
+        argue against a stated line rather than against a mood. Please read
+        [`plan.md`](https://github.com/YashSensei/GoNomad/blob/main/plan.md)
+        — specifically the milestone list, the "Explicitly NOT in the MVP"
+        section, and "Post-MVP" — before filing. A proposal that engages with
+        those lists is far more likely to be accepted than one that ignores
+        them.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        Describe the situation you are actually in, not the feature you have
+        already designed. "I cannot X when Y" beats "add a Z button" — the
+        second forecloses solutions that might be better.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: >-
+        What you would build, and roughly where it lives — daemon, protocol,
+        Android UI, or CLI.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: milestone
+    attributes:
+      label: Which milestone does this belong to?
+      description: >-
+        Your best guess from `plan.md`. Getting it wrong is fine; the point is
+        to have thought about sequencing. Milestones are ordered so that risk
+        is retired before investment, so "this should come first" needs an
+        argument.
+      options:
+        - M1 — transport, pairing, security foundation
+        - M2 — terminal
+        - M3 — files, editor, search
+        - M4 — git
+        - M5 — AI agents and notifications
+        - M6 — hardening, platforms, release
+        - Post-MVP (v0.2+)
+        - Unsure
+    validations:
+      required: true
+
+  # -------------------------------------------------------------------
+  # The non-goals gate. These are product-defining constraints, not
+  # unimplemented features, so a proposal that violates one is a proposal
+  # to build a different product.
+  # -------------------------------------------------------------------
+  - type: checkboxes
+    id: non-goals
+    attributes:
+      label: Stated non-goals
+      description: >-
+        Tick every one this proposal is compatible with. If you cannot tick
+        one, do not delete it — explain in the next field why the exception is
+        worth making. An honest conflict gets a real discussion; a hidden one
+        gets closed.
+      options:
+        - label: >-
+            **Not desktop streaming.** GoNomad is a purpose-built touch
+            interface over the filesystem, terminals, git and agents on your
+            machine — not a remote desktop, not a screen share, not a VNC/RDP
+            client. This proposal does not turn it into one.
+          required: false
+        - label: >-
+            **Not VS Code in a browser.** The editor is CodeMirror 6 in a
+            network-blocked WebView, chosen deliberately over Monaco
+            (`ARCHITECTURE.md` §18.2). This proposal does not require shipping
+            a full desktop IDE or its extension host.
+          required: false
+        - label: >-
+            **No cloud account.** No sign-in, no SaaS coordination server, no
+            vendor-hosted state. Everything is self-hosted or peer-to-peer.
+            This proposal introduces no mandatory hosted service or account.
+          required: false
+        - label: >-
+            **Not on the not-in-MVP list**, or, if it is, this issue argues
+            explicitly for moving it.
+          required: false
+
+  - type: textarea
+    id: conflicts
+    attributes:
+      label: Conflicts with a non-goal?
+      description: >-
+        If you left a box unticked above, make the case here. What changes
+        about the product, and why is the trade worth it? If nothing conflicts,
+        write "none".
+      placeholder: "none"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >-
+        Including "do nothing and keep using X on my laptop". Knowing what you
+        rejected and why is often more informative than the proposal itself.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you be willing to implement this?
+      description: No wrong answer, and a "no" does not weigh against the idea.
+      options:
+        - "Yes, I would like to implement it"
+        - "Yes, with guidance on where it fits"
+        - "No, but I can test it"
+        - "No"
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Sketches, prior art in other tools, links to relevant issues.
+    validations:
+      required: false

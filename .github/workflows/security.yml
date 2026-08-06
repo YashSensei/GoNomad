@@ -1,0 +1,105 @@
+name: Security
+
+# Supply-chain gates: ARCHITECTURE.md §3.11 and plan.md's definition of done
+# ("`cargo deny check` + `cargo audit` clean").
+#
+# Split out from ci.yml on purpose. These checks depend on an *external*,
+# constantly-changing advisory database, so unlike CI they can go red without
+# anyone touching the code. Keeping them in a separate workflow means a new
+# RUSTSEC advisory produces one obviously-security-shaped red mark rather than
+# making the whole CI matrix look broken.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays at 05:17 UTC. Weekly rather than daily because the advisory
+    # database moves slowly and a daily red badge trains people to ignore it.
+    # The odd minute avoids the top-of-hour scheduling stampede on GitHub's
+    # shared runners, which routinely delays :00 crons by tens of minutes.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (${{ matrix.checks }})
+    # Linux only: cargo-deny-action is a container action, and the checks
+    # themselves read Cargo.lock and the crate metadata rather than compiling
+    # anything, so the host OS is irrelevant to the result. deny.toml's
+    # `[graph] targets` is what decides which platforms are evaluated.
+    runs-on: ubuntu-latest
+    strategy:
+      # Each check reported separately, so "a GPL crate appeared" and "a new
+      # CVE landed" are two distinct red marks with two distinct owners.
+      fail-fast: false
+      matrix:
+        checks: [advisories, licenses, bans, sources]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Third-party action pinned to a full commit SHA — see the same note in
+      # ci.yml. The pin also fixes the cargo-deny *binary* version baked into
+      # the action image, which matters because deny.toml's schema is
+      # version-sensitive; deny.toml records the version it targets.
+      - name: cargo-deny check ${{ matrix.checks }}
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check ${{ matrix.checks }}
+          # `--hide-inclusion-graph` is deliberately NOT passed: when a banned
+          # or vulnerable crate shows up, the reverse-dependency tree in the
+          # log is the whole answer to "how did this get here?".
+          arguments: --all-features
+
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Overlaps with `cargo deny check advisories` by design, and the overlap
+      # is not total: cargo-audit is the RustSec project's own reference
+      # implementation, reads Cargo.lock directly, and occasionally diverges
+      # from cargo-deny's interpretation of a fresh advisory. For a security
+      # tool, two independent readers of the same database is cheap insurance.
+      #
+      # taiki-e/install-action downloads a prebuilt cargo-audit instead of
+      # compiling it (which takes minutes). Pinned to a commit SHA.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          tool: cargo-audit
+
+      - name: Audit Cargo.lock
+        # `--deny warnings` escalates the non-vulnerability findings —
+        # unmaintained, unsound, and yanked crates — to failures. A yanked
+        # crate in the lockfile is a reproducibility bug (§24.12), not a note.
+        run: cargo audit --deny warnings
+
+  security-success:
+    name: Security success
+    runs-on: ubuntu-latest
+    needs: [cargo-deny, cargo-audit]
+    if: always()
+    steps:
+      - name: Verify that every security job succeeded
+        run: |
+          echo "cargo-deny=${{ needs.cargo-deny.result }}"
+          echo "cargo-audit=${{ needs.cargo-audit.result }}"
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "true" ]; then
+            echo "::error::One or more security jobs did not succeed."
+            exit 1
+          fi

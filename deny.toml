@@ -132,6 +132,11 @@ confidence-threshold = 0.93
 # Flag entries in `allow` that nothing in the graph actually uses, so this list
 # does not silently accumulate cruft. "warn" rather than "deny" because the set
 # of reachable crates legitimately differs per target and per feature set.
+#
+# As of the three-crate M1 workspace this warns about ISC, Zlib, 0BSD and
+# Unicode-DFS-2016 — all four are forward-looking allowances that will be used
+# once the transport and terminal crates land. The warnings are expected and do
+# not fail CI; if one is still unused at v0.1.0, delete it.
 unused-allowed-license = "warn"
 
 # Dev-dependencies are shipped to contributors, not to users, but they still
@@ -235,9 +240,33 @@ deny = [
 # --- Duplicate-version escape hatch --------------------------------------
 # Every entry should be temporary and should say what unblocks its removal.
 # Keeping this list short is a maintenance task, not a formality.
+# Two ecosystem-wide migrations account for every entry below. They are not
+# GoNomad's doing and cannot be fixed here; they resolve when upstream crates
+# publish updated releases. Recheck this list whenever a dependency is bumped,
+# and delete entries that no longer apply — `cargo deny check bans` reports an
+# unused skip, so a stale entry is visible rather than silent.
 skip = [
-    # Example of the required shape — keep this commented out:
-    # { crate = "windows-sys", reason = "rusqlite and tempfile are mid-migration; remove once both are on 0.60" },
+    # --- syn 2 -> 3 -------------------------------------------------------
+    # Proc-macro only: costs compile time, not binary size.
+    { crate = "syn@2", reason = "serde_derive and thiserror-impl are on syn 3; tracing-attributes, zerocopy-derive and zeroize_derive are still on syn 2. Remove once those derive crates publish syn 3 releases." },
+
+    # --- the rand / getrandom 0.6 -> 0.9 split ----------------------------
+    # One root cause, five symptoms. The RustCrypto stack (snow, ed25519-dalek,
+    # aes-gcm, chacha20poly1305, sha2 — everything reached through
+    # `crypto-common`) is still on the rand_core 0.6 / getrandom 0.2 line,
+    # while proptest and tempfile have moved to rand 0.9 / getrandom 0.3-0.4.
+    # This is the single most common duplicate in the Rust ecosystem right now
+    # and there is no action available to us other than waiting for RustCrypto
+    # to release its next major. Revisit when `crypto-common` 0.2 ships: it
+    # should collapse all five of these at once.
+    { crate = "rand@0.8", reason = "rand/getrandom split: gonomad-core's dev-dependency chain and the RustCrypto stack are on rand 0.8; proptest is on rand 0.9." },
+    { crate = "rand_chacha@0.3", reason = "rand/getrandom split: pulled by rand 0.8." },
+    { crate = "rand_core@0.6", reason = "rand/getrandom split: required by snow, ed25519-dalek and everything under crypto-common. This is the load-bearing one — the crypto crates cannot move until RustCrypto does." },
+    { crate = "getrandom@0.2", reason = "rand/getrandom split: pulled by rand_core 0.6." },
+    { crate = "getrandom@0.3", reason = "rand/getrandom split: pulled by rand_core 0.9 (proptest). tempfile is already on getrandom 0.4, hence three concurrent majors." },
+
+    # --- misc -------------------------------------------------------------
+    { crate = "cpufeatures@0.2", reason = "blake3 is on cpufeatures 0.3; the RustCrypto crates (aes, chacha20, curve25519-dalek, poly1305, polyval, sha2) are on 0.2. Runtime CPU-feature detection only — no shared state, so two copies are harmless. Remove when RustCrypto bumps." },
 ]
 
 # `skip-tree` skips a crate AND everything below it. It is a much bigger hammer

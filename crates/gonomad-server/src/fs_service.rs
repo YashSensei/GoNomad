@@ -195,6 +195,29 @@ impl FsService {
         })
     }
 
+    /// Validates a directory a terminal is about to be started in, returning the
+    /// canonical path.
+    ///
+    /// A terminal's working directory must be inside a workspace root, or
+    /// `pty:spawn` would be a way to obtain a shell anywhere on the disk. The
+    /// shell can of course `cd` out afterwards — that is inherent to granting a
+    /// shell at all, and `ARCHITECTURE.md` §3.6 states it plainly rather than
+    /// implying a boundary that does not exist. This check stops the *starting*
+    /// point from being chosen freely, which is still worth having.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtoError`] from the policy layer — `NotFound` for a directory outside
+    /// every root.
+    pub fn authorize_dir(
+        &self,
+        grant: Option<&DeviceGrant>,
+        requested: &str,
+    ) -> Result<String, ProtoError> {
+        let resolved = self.authorize(grant, Capability::PtySpawn, "pty.spawn", requested)?;
+        Ok(resolved.path().display().to_string())
+    }
+
     /// Runs the policy checks that must precede any disk access.
     ///
     /// Kept as one private helper so that every public method goes through the

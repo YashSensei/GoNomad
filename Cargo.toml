@@ -8,6 +8,7 @@ members = [
     "crates/gonomad-transport",
     "crates/gonomad-pty",
     "crates/gonomad-server",
+    "crates/gonomad-ffi",
 ]
 
 # Crates added as milestones land (see plan.md):
@@ -35,6 +36,7 @@ gonomad-store = { path = "crates/gonomad-store", version = "0.0.1" }
 gonomad-policy = { path = "crates/gonomad-policy", version = "0.0.1" }
 gonomad-transport = { path = "crates/gonomad-transport", version = "0.0.1" }
 gonomad-pty = { path = "crates/gonomad-pty", version = "0.0.1" }
+gonomad-ffi = { path = "crates/gonomad-ffi", version = "0.0.1" }
 
 # --- Serialization (ARCHITECTURE.md §10.3: CBOR for control frames) ---
 serde = { version = "1.0", features = ["derive"] }

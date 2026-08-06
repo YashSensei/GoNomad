@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "gonomad_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gonomad"
 path = "src/main.rs"
@@ -18,6 +22,9 @@ gonomad-core = { workspace = true }
 gonomad-store = { workspace = true }
 gonomad-policy = { workspace = true }
 gonomad-pty = { workspace = true }
+gonomad-transport = { workspace = true }
+# Terminals are shared across connections, so the manager lives behind a lock.
+parking_lot = "0.12"
 tokio = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -39,6 +46,8 @@ dunce = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+dunce = { workspace = true }
+parking_lot = "0.12"
 
 [lints.rust]
 missing_docs = "warn"

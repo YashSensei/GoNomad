@@ -7,8 +7,7 @@
 // Lints are configured in this crate's `[lints]` table in Cargo.toml.
 // Do not duplicate them here: source-level attributes silently override it.
 
-mod fs_service;
-mod state;
+use gonomad_server::{fs_service, router, serve, state};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -43,8 +42,21 @@ enum Command {
         workspace: Option<PathBuf>,
     },
 
+    /// Serve paired devices until interrupted.
+    Serve {
+        /// Workspace root to expose. Defaults to the current directory.
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
+        /// Port to listen on.
+        #[arg(long, default_value_t = gonomad_transport::DEFAULT_PORT)]
+        port: u16,
+    },
+
     /// Report this machine's identity and configuration.
     Status,
+
+    /// List paired devices.
+    Devices,
 
     /// List the files the daemon would expose for a workspace.
     ///
@@ -91,8 +103,12 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Init => cmd_init(&paths),
-        Command::Pair { workspace } => cmd_pair(&paths, workspace),
+        Command::Pair { workspace } => runtime()?.block_on(cmd_pair(&paths, workspace)),
+        Command::Serve { workspace, port } => {
+            runtime()?.block_on(cmd_serve(&paths, workspace, port))
+        }
         Command::Status => cmd_status(&paths),
+        Command::Devices => cmd_devices(&paths),
         Command::Ls { path, workspace } => cmd_ls(path, workspace),
         Command::Cat { path, workspace } => cmd_cat(path, workspace),
         Command::Doctor => {
@@ -118,14 +134,10 @@ fn cmd_init(paths: &state::Paths) -> Result<()> {
     Ok(())
 }
 
-fn cmd_pair(paths: &state::Paths, workspace: Option<PathBuf>) -> Result<()> {
-    let identity = state::load_identity(paths)?;
+async fn cmd_pair(paths: &state::Paths, workspace: Option<PathBuf>) -> Result<()> {
+    let identity = std::sync::Arc::new(state::load_identity(paths)?);
 
-    let workspace = workspace
-        .or_else(|| std::env::current_dir().ok())
-        .context("no workspace given and the current directory is unreadable")?;
-    let workspace = dunce::canonicalize(&workspace)
-        .with_context(|| format!("workspace {} does not exist", workspace.display()))?;
+    let workspace = resolve_workspace(workspace)?;
 
     let secret = PairingSecret::generate();
     let addrs = local_addresses();
@@ -155,13 +167,106 @@ fn cmd_pair(paths: &state::Paths, workspace: Option<PathBuf>) -> Result<()> {
     println!("Scan the code above with the GoNomad app, then confirm the six digits");
     println!("shown on your phone match the ones this machine displays.");
     println!();
+    println!("Waiting for a device…  (Ctrl-C to cancel)");
 
-    // The listener is not wired up yet, so say so rather than appearing to wait.
-    println!("note: this build renders the pairing code but does not yet accept a");
-    println!("      connection — the transport layer is still landing. `gonomad pair`");
-    println!("      is currently useful for verifying the code renders and scans.");
+    let store = gonomad_store::Store::open(&paths.database)
+        .context("could not open the device database")?;
+    let daemon = build_daemon(&workspace)?;
 
+    let device = serve::serve_pairing(
+        identity,
+        &secret,
+        daemon,
+        &store,
+        std::time::Duration::from_millis(gonomad_core::PAIRING_WINDOW_MS),
+    )
+    .await?;
+
+    // The "Paired" line is printed from inside serve_pairing the moment the
+    // device registers, because the connection is deliberately kept open
+    // afterwards so the reply is not truncated.
+    tracing::debug!(device = %device.name, "pairing window closed");
     Ok(())
+}
+
+async fn cmd_serve(paths: &state::Paths, workspace: Option<PathBuf>, port: u16) -> Result<()> {
+    let identity = std::sync::Arc::new(state::load_identity(paths)?);
+    let workspace = resolve_workspace(workspace)?;
+    let store = gonomad_store::Store::open(&paths.database)
+        .context("could not open the device database")?;
+    let daemon = build_daemon(&workspace)?;
+
+    println!("GoNomad serving");
+    println!("  workspace   {}", workspace.display());
+    println!("  addresses   {}", local_addresses().join(", "));
+    println!("  identity    {}", identity.noise_public_key().short());
+    println!();
+    println!("{}", state::KEY_STORAGE_WARNING);
+    println!();
+    println!("Ctrl-C to stop.");
+
+    serve::serve(identity, daemon, store, port).await
+}
+
+fn cmd_devices(paths: &state::Paths) -> Result<()> {
+    let store = gonomad_store::Store::open(&paths.database)
+        .context("could not open the device database")?;
+    let devices = store
+        .devices()
+        .list_active()
+        .context("could not read the device list")?;
+
+    if devices.is_empty() {
+        println!("No devices paired. Run `gonomad pair`.");
+        return Ok(());
+    }
+
+    println!("{} paired device(s):", devices.len());
+    for d in devices {
+        println!(
+            "  {}  {}  key {}",
+            d.id.short(),
+            d.name,
+            d.public_key.short()
+        );
+    }
+    Ok(())
+}
+
+/// Resolves and canonicalises a workspace argument.
+fn resolve_workspace(workspace: Option<PathBuf>) -> Result<PathBuf> {
+    let raw = workspace
+        .or_else(|| std::env::current_dir().ok())
+        .context("no workspace given and the current directory is unreadable")?;
+    dunce::canonicalize(&raw).with_context(|| format!("workspace {} does not exist", raw.display()))
+}
+
+/// Assembles the services a connection needs.
+fn build_daemon(workspace: &std::path::Path) -> Result<std::sync::Arc<router::Daemon>> {
+    let service = build_fs_service(workspace)?;
+    Ok(std::sync::Arc::new(router::Daemon {
+        fs: service,
+        ptys: std::sync::Arc::new(parking_lot::Mutex::new(gonomad_pty::PtyManager::new())),
+        workspace_roots: vec![workspace.display().to_string()],
+        host_name: hostname(),
+    }))
+}
+
+/// The machine's name, for the phone's "paired machine" card.
+fn hostname() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "this machine".to_owned())
+}
+
+/// A multi-threaded tokio runtime for the commands that need one.
+///
+/// Built here rather than with `#[tokio::main]` so the synchronous commands —
+/// `init`, `status`, `ls`, `cat`, `doctor` — do not pay for a runtime they never
+/// use. `doctor` in particular should stay usable on a machine too broken to
+/// start one.
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Runtime::new().context("could not start the async runtime")
 }
 
 fn cmd_status(paths: &state::Paths) -> Result<()> {

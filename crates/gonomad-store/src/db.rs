@@ -33,7 +33,11 @@ pub struct Store {
 
 impl core::fmt::Debug for Store {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Store").field("path", &self.path).finish()
+        // The connection is deliberately omitted: it has no useful Debug and
+        // rendering it would put driver internals into log lines.
+        f.debug_struct("Store")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
     }
 }
 
@@ -138,6 +142,16 @@ impl Store {
     pub fn checkpoint(&self) -> Result<()> {
         checkpoint(&self.conn)
     }
+
+    /// Raw connection access, for this crate's tests only.
+    ///
+    /// Tamper-detection tests have to write the SQL an attacker with database
+    /// access would write; going through the repositories would only prove the
+    /// repositories are consistent with themselves.
+    #[cfg(test)]
+    pub(crate) fn raw_for_test(&self) -> &Connection {
+        &self.conn
+    }
 }
 
 /// Applies the connection pragmas mandated by `ARCHITECTURE.md` §16.1.
@@ -149,7 +163,10 @@ fn configure(conn: &Connection) -> Result<()> {
     // not an error.
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") && !mode.eq_ignore_ascii_case("memory") {
-        tracing::warn!(mode, "database is not in WAL mode; concurrent reads may block");
+        tracing::warn!(
+            mode,
+            "database is not in WAL mode; concurrent reads may block"
+        );
     }
 
     conn.execute_batch(
@@ -303,70 +320,38 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_migration_backup_is_retained() {
+    fn a_retained_backup_is_a_complete_openable_database() {
+        // Exercised directly rather than through `open`, because with a single
+        // shipped migration there is no "older but non-zero" on-disk state to
+        // reach. This is the code that a future migration will depend on.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gonomad.db");
 
-        // Simulate a database left at version 0-plus-something older than the
-        // current build by rewriting the recorded version downwards, so the
-        // next open has real work to do.
-        {
-            let store = Store::open(&path).unwrap();
-            store.settings().set("marker", "keep me").unwrap();
-            store
-                .conn
-                .execute("DELETE FROM schema_version WHERE version >= 1", [])
-                .unwrap();
-            store
-                .conn
-                .execute(
-                    "INSERT INTO schema_version (version, name, applied_at) VALUES (0, 'stub', 0)",
-                    [],
-                )
-                .unwrap();
-        }
-        // Version 0 means "fresh" and is skipped by the backup rule, so give
-        // the file a real prior version by pretending version 1 does not exist
-        // yet while a later one does. With a single shipped migration the only
-        // reachable "older" state is 0, so drive the helper directly instead.
-        {
-            let conn = Connection::open(&path).unwrap();
-            configure(&conn).unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO schema_version (version, name, applied_at)
-                 VALUES (1, 'initial_schema', 0)",
-                [],
-            )
-            .unwrap();
-        }
+        let store = Store::open(&path).unwrap();
+        store.settings().set("marker", "keep me").unwrap();
+        store.checkpoint().unwrap();
 
-        assert!(back_up_before_migrating_for_test(&path));
+        let backup = retain_backup(&path, 1).unwrap();
+        assert!(backup.exists());
+        assert!(backup.to_string_lossy().ends_with(".pre-v1.bak"));
+
+        let restored = Connection::open(&backup).unwrap();
+        let marker: String = restored
+            .query_row("SELECT value FROM settings WHERE key = 'marker'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(marker, "keep me");
     }
 
-    /// Forces the backup path by claiming the on-disk version is one behind.
-    fn back_up_before_migrating_for_test(path: &Path) -> bool {
-        let conn = Connection::open(path).unwrap();
-        configure(&conn).unwrap();
-        conn.execute("DELETE FROM schema_version", []).unwrap();
-        conn.execute(
-            "INSERT INTO schema_version (version, name, applied_at) VALUES (?1, 'older', 0)",
-            [migrations::LATEST_VERSION.saturating_sub(1).max(0)],
-        )
-        .unwrap();
-
-        // With LATEST_VERSION == 1 the only "older" version is 0, which is the
-        // documented skip case. Assert the skip explicitly so this test stays
-        // meaningful, and exercise the copy itself directly.
-        let recorded = migrations::current_version(&conn).unwrap();
-        back_up_before_migrating(&conn, path).unwrap();
-        if recorded == 0 {
-            let backup = path.with_file_name(format!(
-                "{}.pre-v{recorded}.bak",
-                path.file_name().unwrap().to_string_lossy()
-            ));
-            return !backup.exists();
+    #[test]
+    fn backing_up_a_missing_file_reports_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.db");
+        match retain_backup(&missing, 3).unwrap_err() {
+            StoreError::Io { path, .. } => assert!(path.ends_with(".pre-v3.bak"), "{path}"),
+            other => panic!("expected an Io error, got {other:?}"),
         }
-        true
     }
 
     #[test]
@@ -391,6 +376,7 @@ mod tests {
     #[test]
     fn debug_shows_the_path_and_not_the_connection() {
         let store = Store::open_in_memory().unwrap();
-        assert_eq!(format!("{store:?}"), "Store { path: None }");
+        let rendered = format!("{store:?}");
+        assert!(rendered.starts_with("Store { path: None"), "{rendered}");
     }
 }

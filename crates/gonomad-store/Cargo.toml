@@ -21,6 +21,9 @@ time = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
+# Used only to assert that the public types round-trip through a human-readable
+# encoding; the crate itself never serialises to JSON.
+serde_json = { workspace = true }
 
 [lints.rust]
 missing_docs = "warn"

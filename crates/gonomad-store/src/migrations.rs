@@ -186,7 +186,8 @@ fn run_one(
     migration: &Migration,
     applied_at: i64,
 ) -> core::result::Result<(), DatabaseError> {
-    tx.execute_batch(migration.sql).map_err(DatabaseError::new)?;
+    tx.execute_batch(migration.sql)
+        .map_err(DatabaseError::new)?;
     tx.execute(
         "INSERT INTO schema_version (version, name, applied_at) VALUES (?1, ?2, ?3)",
         rusqlite::params![migration.version, migration.name, applied_at],
@@ -394,7 +395,10 @@ mod tests {
     #[test]
     fn the_shipped_migration_set_is_well_formed() {
         validate(MIGRATIONS).unwrap();
-        assert!(LATEST_VERSION >= 1);
+        assert!(
+            !MIGRATIONS.is_empty(),
+            "a schema needs at least one migration"
+        );
         assert_eq!(
             LATEST_VERSION,
             MIGRATIONS.iter().map(|m| m.version).max().unwrap()

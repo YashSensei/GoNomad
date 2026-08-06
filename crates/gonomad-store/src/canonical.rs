@@ -54,22 +54,35 @@ pub(crate) enum Item<'a> {
 /// Writes a CBOR argument head: the major type plus the shortest encoding of
 /// `arg`.
 fn head(out: &mut Vec<u8>, major: u8, arg: u64) {
+    // Additional-information values from RFC 8949 §3: 0..=23 inline, then
+    // 24/25/26/27 for a 1/2/4/8-byte argument. Written in hex because these
+    // are bit patterns OR-ed into the major type, not quantities.
+    //
+    // Declared before the first statement: items are in scope for the whole
+    // block regardless, so placing them mid-body reads as if they were
+    // sequenced (clippy::items_after_statements).
+    const AI_ONE_BYTE: u8 = 0x18;
+    const AI_TWO_BYTES: u8 = 0x19;
+    const AI_FOUR_BYTES: u8 = 0x1a;
+    const AI_EIGHT_BYTES: u8 = 0x1b;
+
     let mt = major << 5;
+
     if let Ok(byte) = u8::try_from(arg) {
-        if byte < 24 {
+        if byte < AI_ONE_BYTE {
             out.push(mt | byte);
         } else {
-            out.push(mt | 24);
+            out.push(mt | AI_ONE_BYTE);
             out.push(byte);
         }
     } else if let Ok(short) = u16::try_from(arg) {
-        out.push(mt | 25);
+        out.push(mt | AI_TWO_BYTES);
         out.extend_from_slice(&short.to_be_bytes());
     } else if let Ok(word) = u32::try_from(arg) {
-        out.push(mt | 26);
+        out.push(mt | AI_FOUR_BYTES);
         out.extend_from_slice(&word.to_be_bytes());
     } else {
-        out.push(mt | 27);
+        out.push(mt | AI_EIGHT_BYTES);
         out.extend_from_slice(&arg.to_be_bytes());
     }
 }
@@ -256,7 +269,10 @@ mod tests {
     fn encoding_is_stable_across_repeated_calls() {
         let once = map(&[("k", Item::Bytes(&[9; 32])), ("n", Item::Uint(7))]);
         for _ in 0..100 {
-            assert_eq!(map(&[("k", Item::Bytes(&[9; 32])), ("n", Item::Uint(7))]), once);
+            assert_eq!(
+                map(&[("k", Item::Bytes(&[9; 32])), ("n", Item::Uint(7))]),
+                once
+            );
         }
     }
 

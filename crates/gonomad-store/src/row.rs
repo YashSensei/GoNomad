@@ -15,7 +15,8 @@ use crate::error::{Result, StoreError};
 /// A negative value means the row was written by something other than this
 /// crate, which for the audit table is a tamper signal.
 pub(crate) fn u64_from_i64(table: &'static str, column: &str, raw: i64) -> Result<u64> {
-    u64::try_from(raw).map_err(|_| StoreError::corrupt(table, format!("{column} is negative: {raw}")))
+    u64::try_from(raw)
+        .map_err(|_| StoreError::corrupt(table, format!("{column} is negative: {raw}")))
 }
 
 /// Narrows a `u64` for storage in SQLite's signed `INTEGER` column.

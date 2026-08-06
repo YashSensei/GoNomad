@@ -40,6 +40,7 @@ pub mod error;
 pub mod events;
 pub mod frame;
 pub mod ids;
+pub mod methods;
 
 pub use capability::{Capability, CapabilitySet};
 pub use control::{
@@ -53,6 +54,7 @@ pub use events::{
 };
 pub use frame::{Frame, FrameError, FrameFlags};
 pub use ids::{DeviceId, Digest, PublicKey};
+pub use methods::method;
 
 /// The wire protocol version this build speaks.
 ///

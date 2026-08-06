@@ -514,11 +514,13 @@ name = "gonomad-policy"
 version = "0.0.1"
 dependencies = [
  "camino",
+ "ciborium",
  "dunce",
  "globset",
  "gonomad-proto",
  "proptest",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
@@ -549,6 +551,7 @@ dependencies = [
  "proptest",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "time",

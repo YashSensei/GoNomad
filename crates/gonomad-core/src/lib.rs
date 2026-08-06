@@ -17,6 +17,7 @@
 //! |---|---|
 //! | [`identity`] | The Ed25519 device keypair that *is* the credential |
 //! | [`sas`] | The six-digit Short Authentication String shown during pairing |
+//! | [`pairing`] | The QR ticket, the manual fallback code, and the pairing window |
 //!
 //! Landing in later M1 work: the Noise IK session, request correlation, the
 //! reconnect policy, the client-side cache, and the offline write queue.
@@ -36,7 +37,12 @@
 // Do not duplicate them here: source-level attributes silently override it.
 
 pub mod identity;
+pub mod pairing;
 pub mod sas;
 
 pub use identity::{DeviceIdentity, IdentityError, SEED_LEN, SIGNATURE_LEN};
+pub use pairing::{
+    ManualCode, PairingError, PairingSecret, PairingTicket, PairingWindow, MAX_PAIRING_ATTEMPTS,
+    PAIRING_WINDOW_MS,
+};
 pub use sas::{Sas, SAS_DIGITS};

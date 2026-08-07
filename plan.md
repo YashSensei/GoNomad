@@ -3,9 +3,11 @@
 > **Your development machine, anywhere.**
 > An open-source, self-hosted mobile companion for your own dev machine. Not a desktop stream — a purpose-built touch interface over the filesystem, terminals, git, and AI agents already on your laptop.
 
-**Current status:** 🚧 Pre-alpha · **M1 in progress** · not yet usable
-**Built so far:** `gonomad-proto` (wire contract + codec), `gonomad-core` (device identity, pairing, SAS), `gonomad-store` (schema, migrations, hash-chained audit), `gonomad-policy` (capabilities, path guards, rate limits). ~405 tests, clippy pedantic clean. No daemon binary, no transport, no Android app yet — nothing to run.
-**Next action:** finish M1 — iroh transport, the Noise IK session, and the `gonomad` CLI
+**Current status:** 🚧 Pre-alpha · **M1 substantially complete, M2 partially built** · runnable end to end on one machine
+**Built so far:** all eight crates. `gonomad-proto` (wire contract + codec), `gonomad-core` (device identity, three domain-separated subkeys, pairing, SAS), `gonomad-store` (schema, migrations, hash-chained audit), `gonomad-policy` (capabilities, path guards, rate limits), `gonomad-transport` (**iroh** hole-punched QUIC + relay, LAN TCP, Noise IK/IKpsk2 inside both), `gonomad-pty` (ConPTY, job objects, `vt100` screen authority), `gonomad-server` (`gonomad` daemon + CLI), `gonomad-ffi` (UniFFI → Kotlin). Android app builds to a signed APK with multi-tab terminals that keep running while backgrounded. 674 tests, clippy pedantic clean, `cargo deny` clean.
+**Verified working:** `init`, `pair` (QR + SAS), `serve`, pairing from a real phone, terminal spawn/input/resize/kill, terminals surviving disconnect and reattaching on reconnect.
+**Not yet verified:** NAT traversal through real home routers and the CGNAT relay fallback — both need two genuinely separate networks and cannot be proven from one machine.
+**Next action:** confirm off-network pairing from a phone on mobile data, then M2's remaining terminal work (cell diffs, adaptive frame rate, Compose Canvas renderer)
 **Canonical design:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) — this file is the execution roadmap; that file is the *why*
 
 > [!NOTE]

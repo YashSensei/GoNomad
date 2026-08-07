@@ -635,6 +635,44 @@ mod tests {
     }
 
     #[test]
+    fn a_real_machines_hint_set_still_fits_a_scannable_qr() {
+        // The test above uses a *representative* ticket. This one uses what a real
+        // Windows laptop actually produced: the STUN-discovered public address, the
+        // Wi-Fi address, two virtual-adapter addresses that Hyper-V and WSL add, two
+        // IPv6 addresses, and an n0 relay URL. That is 7 records, not 3, and it is
+        // the ordinary case rather than a pathological one — so the budget has to
+        // hold here or the QR stops scanning on ordinary machines.
+        //
+        // 468 characters is QR version 11 at error-correction level M in
+        // alphanumeric mode. Past that the code needs more modules than a laptop
+        // screen renders legibly for a phone camera held at arm's length.
+        //
+        // Measured: this ticket is **342 characters**, so there is real headroom.
+        // Two of those hints are Hyper-V and WSL virtual adapters the phone can
+        // never reach, and they are deliberately *not* filtered: they cost about 16
+        // characters, iroh races hints so a dead one costs nothing at dial time, and
+        // any heuristic sharp enough to drop them would also drop a legitimate
+        // `192.168.x.x` LAN address — breaking the fast path the hints exist for.
+        let mut t = ticket();
+        t.addr_hints = vec![
+            "122.172.80.215:18835".into(),
+            "192.168.1.17:65101".into(),
+            "192.168.67.1:65101".into(),
+            "192.168.73.1:65101".into(),
+            "[2401:4900:894d:3a7b:4ff8:3509:4ad3:39c8]:65103".into(),
+            "[2401:4900:894d:3a7b:e421:8a83:7818:3c52]:65103".into(),
+        ];
+        t.relay_hint = Some("https://aps1-1.relay.n0.iroh.link./".into());
+
+        let payload = t.encode(&PairingSecret::generate());
+        assert!(
+            payload.len() <= 468,
+            "a real machine's ticket is {} characters, past QR v11 capacity",
+            payload.len()
+        );
+    }
+
+    #[test]
     fn address_hints_are_stored_compactly() {
         // The binary hint encoding is what pays for the node id. An IPv4 hint
         // costs 8 bytes of body (kind, length, four octets, port) rather than

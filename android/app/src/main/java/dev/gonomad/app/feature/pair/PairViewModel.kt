@@ -97,9 +97,12 @@ class PairViewModel(private val session: SessionRepository) : ViewModel() {
     /**
      * Runs the handshake.
      *
-     * Failures here are read with [ErrorSite.Pairing]: a payload that is not a
-     * GoNomad code arrives as `Protocol`, and a wrong or expired code arrives as
-     * `Transport` (§19 R24) — which must not be rendered as a network problem.
+     * Failures here are read with [ErrorSite.Pairing]. Three distinct outcomes
+     * reach this point and each wants different advice: a payload that is not a
+     * GoNomad code at all arrives as `Protocol`, a wrong or expired code arrives as
+     * `PairingRejected` (§19 R24 — the machine answered and the phone could not
+     * authenticate the answer), and a machine that was never reached arrives as
+     * `Transport`. Only the middle one is a reason to rescan.
      */
     private fun beginPairing(payload: String) {
         _state.update { it.copy(step = PairStep.Handshaking, error = null) }

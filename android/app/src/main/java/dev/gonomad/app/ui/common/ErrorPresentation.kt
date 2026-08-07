@@ -22,12 +22,19 @@ enum class ErrorAction { Retry, GoPair, None }
 /**
  * Where the failure happened.
  *
- * Two variants read differently during pairing, and getting them wrong is not
- * cosmetic. With `IKpsk2` the machine finishes its half of the handshake even
- * when the pairing code was wrong, so a mistyped code surfaces on the phone as
- * `Transport` — the authenticated `sys.register` never round-trips (§19 R24).
- * Rendering that as "check your network" sends the user to reboot their router
- * over a typo.
+ * Some errors read differently during pairing, so the site decides the wording.
+ *
+ * What the site must **not** be used for is guessing that a failure was a bad
+ * pairing code. With `IKpsk2` the machine finishes its half of the handshake even
+ * when the code is wrong, so the phone learns the truth only when it fails to
+ * authenticate the reply (§19 R24) — and the core reports exactly that, as
+ * `PairingRejected`. A `Transport` failure at the pairing site means the machine
+ * was never reached and the code was never checked.
+ *
+ * This distinction was conflated once, and both halves of the mistake cost time:
+ * a phone that had simply switched to mobile data was told its code did not
+ * match, and the advice attached to it was to get on the same Wi-Fi — which the
+ * iroh transport specifically removes the need for. Keep the two apart.
  */
 enum class ErrorSite { General, Pairing }
 

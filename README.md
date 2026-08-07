@@ -26,23 +26,24 @@ SaaS control plane, and no port forwarding.
 ## Status: pre-alpha
 
 > [!WARNING]
-> **GoNomad is not usable yet. There is nothing to install and nothing to run.**
+> **GoNomad runs, but it is not ready for anything you care about.**
 >
-> There is no release, no daemon binary, and no APK. `cargo install gonomad`
-> does not work. Every command shown in [Quickstart](#quickstart-not-yet-functional)
-> below is a design target, not a shipping feature. The security properties
-> described on this page are *designed and partly written*, not proven — and
-> certainly not audited. Do not point this at anything you care about, because
-> at present there is nothing to point.
+> There is no tagged release and no published artifact — `cargo install gonomad`
+> does not work, and you must build the daemon and the APK yourself. Pairing and
+> terminals work end to end; files, search, git, and AI agents do not exist yet,
+> so most of [Quickstart](#quickstart-not-yet-functional) is still a design
+> target.
+>
+> **The security properties on this page are written and tested, not audited.**
+> One is a known gap rather than an unknown: the daemon's identity key is stored
+> in a plain file, not the OS keyring, so anyone who can read your user profile
+> can impersonate your machine. That alone should keep this away from anything
+> valuable.
 >
 > The roadmap, milestone by milestone, is in [`plan.md`](./plan.md).
 > The design rationale is in [`ARCHITECTURE.md`](./ARCHITECTURE.md).
 
 ### What actually exists in this repository
-
-Milestone M1 — the security and protocol foundation — is under active
-construction. What is written is library code with tests; none of it is wired
-into a program you can run.
 
 | Path | State |
 |---|---|
@@ -53,10 +54,23 @@ into a program you can run.
 | `crates/gonomad-core` | Device identity, the pairing state machine, SAS derivation |
 | `crates/gonomad-policy` | Path guards, the secret denylist, the capability engine, rate limits |
 | `crates/gonomad-store` | SQLite schema and forward-only migrations, device records, the hash-chained audit log |
+| `crates/gonomad-transport` | The iroh endpoint (hole-punched QUIC and a relay fallback), the LAN TCP rung, and the Noise IK/IKpsk2 session that runs inside both |
+| `crates/gonomad-pty` | ConPTY, Job Object process-tree teardown, shell detection, and the server-side `vt100` screen authority |
+| `crates/gonomad-server` | The daemon and the `gonomad` CLI (`init`, `pair`, `serve`, `devices`, `doctor`) |
+| `crates/gonomad-ffi` | The UniFFI surface the Android app is generated from |
+| `android/` | The Kotlin/Compose app: pairing, device list, and multi-tab terminals |
 
-Not started: the iroh transport, the daemon and its `gonomad` CLI, the tray UI,
-PTYs, filesystem services, search, git, AI agents, notifications, and the entire
-Android application. **Nothing runs end to end.**
+**It runs end to end**, on Windows, for pairing and terminals: `gonomad init`,
+`gonomad pair`, scan the QR, and drive real shells from the phone in switchable
+tabs that keep running while the app is backgrounded or disconnected.
+
+Not started: the tray UI, filesystem services, search, git, AI agents, and
+notifications. The Compose `Canvas` terminal renderer and cell-diff streaming are
+also still outstanding — terminals currently render whole screens.
+
+Not yet verified: NAT traversal through real home routers, and the relay fallback
+under CGNAT. Both need two genuinely separate networks, so neither can be proven
+from a single machine.
 
 ---
 
@@ -179,10 +193,10 @@ scheduled.
 | Frame layout, CBOR codec, version negotiation, closed error enum | In progress — M1 |
 | Capability vocabulary, capability engine, rate limits | In progress — M1 |
 | Path canonicalisation and workspace-root guards; the secret denylist | In progress — M1 |
-| Hash-chained audit log; SQLite schema and migrations | In progress — M1 |
-| QR pairing: 120-second single-use window, 6-digit SAS confirmation | In progress — M1 |
-| iroh QUIC transport; dial a laptop by its `NodeId`, never by IP | Planned — M1 |
-| LAN → hole-punched direct → relay tier ladder, visible in the UI | Planned — M1 |
+| Hash-chained audit log; SQLite schema and migrations | Built |
+| QR pairing: 120-second single-use window, 6-digit SAS confirmation | Built — paired from a real phone |
+| iroh QUIC transport; dial a laptop by its `NodeId`, never by IP | Built — untested across real NATs |
+| LAN → hole-punched direct → relay tier ladder, visible in the UI | Built — the tier reaches the UI chip |
 | mDNS discovery on the local network | Planned — M1 |
 | Manual-entry pairing fallback over a real PAKE (SPAKE2+/CPace) | Planned — M1 |
 | Device list, per-device capability editing, instant revocation | Planned — M1 |

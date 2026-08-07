@@ -97,9 +97,17 @@ class FakeGonomadClient(private val stateDir: String) : GonomadClientInterface {
         if (payload.contains("expired")) {
             throw GonomadException.Protocol("That pairing window has expired.")
         }
-        // A wrong code shows up as Transport, exactly as it does for real (§19 R24).
+        // A wrong code shows up as PairingRejected, exactly as it does for real: the
+        // machine answers, and the phone's AEAD check on that answer fails (§19
+        // R24). Not `Transport` — that is reserved for never reaching the machine,
+        // and the fake has to model the distinction or it teaches the UI the wrong
+        // lesson.
         if (payload.contains("wrong")) {
-            throw GonomadException.Transport("The machine would not register this device.")
+            throw GonomadException.PairingRejected()
+        }
+        // And the other half of that split, so both branches are demonstrable.
+        if (payload.contains("unreachable")) {
+            throw GonomadException.Transport("Could not reach your machine.")
         }
 
         // A real SAS is derived from the handshake hash. This derives from the

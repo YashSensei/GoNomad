@@ -75,7 +75,7 @@ iroh = "1.0.3"
 data-encoding = "2.6"
 
 # --- Storage (ARCHITECTURE.md §16.1: bundled SQLite, no system dep) ---
-rusqlite = { version = "0.32", features = ["bundled", "blob"] }
+rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 
 # --- Async ---
 tokio = { version = "1.40", features = ["full"] }

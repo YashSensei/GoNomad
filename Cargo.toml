@@ -61,7 +61,7 @@ subtle = "2.6"
 zeroize = { version = "1.8", features = ["derive"] }
 # Noise IK session layer. Layered inside QUIC deliberately, so that security is
 # independent of transport and adding a tunnel fallback cannot weaken it (§3.4).
-snow = "0.9"
+snow = "0.10"
 
 # --- Transport: NAT traversal (ARCHITECTURE.md §4.3) ---
 # QUIC keyed by public key rather than IP, with hole punching and a relay

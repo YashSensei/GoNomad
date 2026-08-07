@@ -1,10 +1,9 @@
 //! The transport abstraction from `ARCHITECTURE.md` §4.5.
 //!
-//! One interface, several bindings. Today there is exactly one implementation —
-//! [`crate::TcpTransport`], Tier 0 of the ladder (§4.2) — and the whole point of
-//! the indirection is that **iroh will implement these same traits** for Tiers 1
-//! and 2 (hole-punched direct QUIC, and relayed QUIC) without anything above
-//! this crate changing.
+//! One interface, two bindings: [`crate::TcpTransport`] for Tier 0 of the ladder
+//! (§4.2) and [`crate::IrohTransport`] for Tiers 1 and 2. The indirection has now
+//! earned its keep — the QUIC binding landed behind these exact traits, and
+//! nothing above this crate changed to accommodate it.
 //!
 //! # Deviations from the sketch in §4.5, and why
 //!
@@ -30,7 +29,7 @@ use gonomad_proto::PublicKey;
 use tokio::sync::watch;
 
 use crate::error::Result;
-use crate::mux::{RecvStream, SendStream};
+use crate::stream::{RecvStream, SendStream};
 
 /// A boxed, `Send` future — the object-safe stand-in for `async fn` in a trait.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -44,9 +43,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub enum Tier {
     /// Tier 0 — same physical network, no NAT traversal, no relay.
     Lan,
-    /// Tier 1 — hole-punched direct peer-to-peer. Landing with iroh.
+    /// Tier 1 — hole-punched direct peer-to-peer, over iroh's QUIC.
     Direct,
-    /// Tier 2 — carried by a relay that sees only ciphertext. Landing with iroh.
+    /// Tier 2 — carried by an iroh relay that sees only ciphertext.
     Relay,
 }
 
@@ -77,8 +76,10 @@ pub struct PathInfo {
     /// Whether traffic is passing through a relay.
     ///
     /// Always `false` for Tier 0. Kept in the struct rather than derived from
-    /// [`PathInfo::tier`] because iroh can upgrade a relayed path to a direct
-    /// one mid-session, and the two facts are updated by different events.
+    /// [`PathInfo::tier`] because iroh can upgrade a relayed path to a direct one
+    /// mid-session, and because a connection may hold a relay path open beside a
+    /// direct one — "a relay exists" and "traffic is going through it" are not the
+    /// same fact.
     pub relayed: bool,
 }
 
@@ -110,8 +111,11 @@ impl PathInfo {
 /// and handing the wrong one to a handshake fails in a way that is tedious to
 /// diagnose from the wire.
 ///
-/// When iroh lands this becomes the `NodeId` — same idea, same "a peer is a
-/// public key, not an address" property (§4.3).
+/// This stays the Noise static key on both bindings, and is deliberately *not*
+/// the iroh `NodeId`: the Noise key is the device credential the paired-device
+/// table is keyed on, while the `NodeId` is a transport address that travels as an
+/// [`AddrHint::Node`]. Conflating them would tie the security model to one
+/// transport, which is exactly what §3.4 declines to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerId(PublicKey);
 
@@ -137,9 +141,10 @@ impl PeerId {
 
 /// A place a peer might be reachable.
 ///
-/// Sourced from the pairing QR's `addr_hints` and `relay_hint` (§4.6), so the
-/// first connection after pairing needs no discovery at all. Hints are advisory:
-/// a stale one costs a fallback, never a failure.
+/// Sourced from the pairing QR (§4.6), so the first connection after pairing needs
+/// no discovery at all. Hints are advisory — a stale one costs a fallback, never a
+/// failure — with the single exception of [`AddrHint::Node`], which iroh cannot
+/// dial without.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AddrHint {
@@ -147,6 +152,14 @@ pub enum AddrHint {
     Direct(std::net::SocketAddr),
     /// A relay URL. Ignored by Tier 0; consumed by iroh at Tier 2.
     Relay(String),
+    /// The peer's iroh `NodeId`.
+    ///
+    /// Strictly speaking an identity rather than an address — but in iroh the two
+    /// are the same fact (§4.3), and carrying it as a hint is what lets
+    /// [`Transport::connect`] keep the signature §4.5 specifies. [`crate::iroh`]
+    /// requires it; [`crate::TcpTransport`] ignores it, because a `NodeId` is not
+    /// something you can open a socket to.
+    Node(PublicKey),
 }
 
 impl AddrHint {
@@ -162,9 +175,14 @@ impl AddrHint {
     }
 
     /// Every hint carried by a pairing ticket, in the order it should be tried.
+    ///
+    /// The `NodeId` comes **first**, because it is the only one that is mandatory
+    /// for the rung that works off-LAN, and a caller scanning the list for it
+    /// should find it without walking a stale address list.
     #[must_use]
     pub fn from_ticket(ticket: &gonomad_core::PairingTicket) -> Vec<Self> {
-        let mut hints: Vec<Self> = ticket.addr_hints.iter().map(|h| Self::parse(h)).collect();
+        let mut hints = vec![Self::Node(ticket.node_id)];
+        hints.extend(ticket.addr_hints.iter().map(|h| Self::parse(h)));
         if let Some(relay) = &ticket.relay_hint {
             hints.push(Self::Relay(relay.clone()));
         }
@@ -176,7 +194,16 @@ impl AddrHint {
     pub const fn socket_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             Self::Direct(addr) => Some(*addr),
-            Self::Relay(_) => None,
+            Self::Relay(_) | Self::Node(_) => None,
+        }
+    }
+
+    /// The peer's `NodeId`, when this is a node hint.
+    #[must_use]
+    pub const fn node_id(&self) -> Option<PublicKey> {
+        match self {
+            Self::Node(key) => Some(*key),
+            Self::Direct(_) | Self::Relay(_) => None,
         }
     }
 }
@@ -273,11 +300,16 @@ pub trait Conn: Send + Sync + 'static {
 
     /// Watches the path for change.
     ///
-    /// On Tier 0 this never fires after the connection is established, and that
-    /// is the honest answer rather than a missing feature: a TCP connection is
-    /// identified by its 4-tuple, so a network change does not migrate the
-    /// path — it kills the socket. QUIC connection migration (§4.4) is precisely
-    /// what makes this channel interesting, and it arrives with iroh.
+    /// On Tier 0 this never fires after the connection is established, and that is
+    /// the honest answer rather than a missing feature: a TCP connection is
+    /// identified by its 4-tuple, so a network change does not migrate the path —
+    /// it kills the socket.
+    ///
+    /// On [`crate::IrohTransport`] it fires whenever the observed path changes,
+    /// which is what carries the §4.4 relay→direct upgrade: a session that started
+    /// out relayed reports [`Tier::Relay`], then reports [`Tier::Direct`] once hole
+    /// punching succeeds, with no reconnect and nothing for the caller to do but
+    /// redraw a chip.
     fn path_changes(&self) -> watch::Receiver<PathInfo>;
 
     /// The peer's authenticated Noise static key.
@@ -326,6 +358,8 @@ pub trait Transport: Send + Sync + 'static {
 ///
 /// When it lands it implements this trait, and [`crate::TcpTransport`] gains an
 /// optional `Arc<dyn Discovery>` consulted after the hints are exhausted.
+/// [`crate::IrohTransport`] needs none of it: iroh does its own address discovery
+/// (DNS or the Mainline DHT, §4.6) below this interface.
 pub trait Discovery: Send + Sync + 'static {
     /// Finds addresses for `peer`.
     ///
@@ -368,25 +402,34 @@ mod tests {
     }
 
     #[test]
-    fn ticket_hints_come_out_in_dial_order_with_the_relay_last() {
+    fn ticket_hints_come_out_with_the_node_id_first_and_the_relay_last() {
         let ticket = gonomad_core::PairingTicket {
             daemon_key: key(1),
+            node_id: key(2),
             addr_hints: vec!["10.0.0.2:1234".into(), "not-an-address".into()],
             relay_hint: Some("https://relay.example.com".into()),
         };
         let hints = AddrHint::from_ticket(&ticket);
-        assert_eq!(hints.len(), 3);
-        assert!(matches!(hints[0], AddrHint::Direct(_)));
+        assert_eq!(hints.len(), 4);
+        assert_eq!(hints[0], AddrHint::Node(key(2)));
+        assert!(matches!(hints[1], AddrHint::Direct(_)));
         assert_eq!(
-            hints[2],
+            hints[3],
             AddrHint::Relay("https://relay.example.com".into())
         );
     }
 
     #[test]
-    fn only_direct_hints_yield_a_socket_address() {
+    fn each_hint_kind_yields_only_its_own_value() {
         assert!(AddrHint::parse("10.0.0.2:1").socket_addr().is_some());
         assert!(AddrHint::parse("https://r").socket_addr().is_none());
+        assert!(AddrHint::Node(key(3)).socket_addr().is_none());
+        assert_eq!(AddrHint::Node(key(3)).node_id(), Some(key(3)));
+        assert!(AddrHint::parse("10.0.0.2:1").node_id().is_none());
+        // A node id must never be produced by parsing text: it arrives typed, from
+        // the ticket, and treating an arbitrary string as one would mean dialling a
+        // key nobody vouched for.
+        assert!(AddrHint::parse(&"a".repeat(52)).node_id().is_none());
     }
 
     #[test]

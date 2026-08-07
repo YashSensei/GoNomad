@@ -19,7 +19,7 @@ use gonomad_proto::{Frame, FrameFlags, PublicKey};
 use gonomad_transport::mux::{RECORD_PREFIX_LEN, SEGMENT_HEADER_LEN};
 use gonomad_transport::{
     AddrHint, Allowlist, ClientConfig, MuxConfig, PeerId, ServerConfig, TcpConnection,
-    TcpTransport, TransportError, CONTROL_CHANNEL,
+    TcpTransport, TransportError, CONTROL_STREAM,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -106,7 +106,7 @@ async fn a_paired_device_reconnects_and_exchanges_frames_both_ways() {
     assert_eq!(server_conn.peer_key(), phone.noise_public_key());
 
     let (mut ctx, mut crx) = client_conn.open_bi().expect("open control stream");
-    assert_eq!(ctx.id(), CONTROL_CHANNEL, "the first stream is control");
+    assert_eq!(ctx.id(), CONTROL_STREAM, "the first stream is control");
     ctx.send(&frame(b"fs.read src/main.rs"))
         .await
         .expect("client send");
@@ -297,8 +297,8 @@ async fn a_large_transfer_cannot_starve_the_control_channel() {
 
     let (mut control_tx, mut control_rx) = client_conn.open_bi().expect("control");
     let (mut bulk_tx, _bulk_rx) = client_conn.open_bi().expect("bulk");
-    assert_eq!(control_tx.id(), CONTROL_CHANNEL);
-    assert_ne!(bulk_tx.id(), CONTROL_CHANNEL);
+    assert_eq!(control_tx.id(), CONTROL_STREAM);
+    assert_ne!(bulk_tx.id(), CONTROL_STREAM);
 
     // Channels arrive in the order they were opened.
     let (mut server_control_tx, mut server_control_rx) =
@@ -308,7 +308,7 @@ async fn a_large_transfer_cannot_starve_the_control_channel() {
     let (_server_bulk_tx, mut server_bulk_rx) = within("accept bulk", server_conn.accept_bi())
         .await
         .expect("accept bulk");
-    assert_eq!(server_control_tx.id(), CONTROL_CHANNEL);
+    assert_eq!(server_control_tx.id(), CONTROL_STREAM);
 
     // The daemon echoes control frames immediately...
     let echo = tokio::spawn(async move {

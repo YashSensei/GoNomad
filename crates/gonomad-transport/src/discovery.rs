@@ -12,6 +12,15 @@
 //! that actually happens, because a QR advertising `127.0.0.1` scans fine and
 //! then never connects.
 //!
+//! # Prefer the endpoint's own view when there is one
+//!
+//! A daemon running [`crate::IrohTransport`] should build its hints from
+//! [`crate::IrohTransport::addr_hints`] rather than from this module. iroh already
+//! knows which of its addresses are reachable, which relay it settled on, and what
+//! its `NodeId` is — and a QR built from two sources that disagree is a support
+//! ticket. This module remains the answer for the Tier 0 listener, whose port is
+//! its own and which has no equivalent view.
+//!
 //! # The mDNS seam
 //!
 //! §4.6 specifies mDNS (`_gonomad._udp.local`) advertising the node id and port.

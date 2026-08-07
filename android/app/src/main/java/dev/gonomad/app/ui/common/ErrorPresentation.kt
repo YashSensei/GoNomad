@@ -70,12 +70,18 @@ fun Throwable.toPresentation(site: ErrorSite = ErrorSite.General): ErrorPresenta
             action = ErrorAction.None,
         )
 
+        // Reachability, at both sites. This used to claim "that code didn't
+        // match" while pairing, which was wrong and expensively so: a phone on
+        // mobile data and a genuinely mistyped code produced the same sentence,
+        // and it named the one cause the user could not do anything about. A
+        // rejected code is now its own variant below.
         is GonomadException.Transport -> when (site) {
             ErrorSite.Pairing -> ErrorPresentation(
-                title = "That code didn't match",
-                detail = "The handshake completed but your machine would not register this " +
-                    "device, which is what a wrong or expired pairing code looks like from " +
-                    "here. Run `gonomad pair` again and scan the new QR.",
+                title = "Couldn't reach your machine",
+                detail = "$detail The code itself was never checked — nothing answered. " +
+                    "Check that `gonomad pair` is still running and that the machine is " +
+                    "awake. Different networks are fine; it does not need to be the same " +
+                    "Wi-Fi.",
                 actionLabel = "Try again",
                 action = ErrorAction.Retry,
             )
@@ -87,6 +93,16 @@ fun Throwable.toPresentation(site: ErrorSite = ErrorSite.General): ErrorPresenta
                 action = ErrorAction.Retry,
             )
         }
+
+        // The machine answered and turned the code down. The only branch where
+        // rescanning is the right advice.
+        is GonomadException.PairingRejected -> ErrorPresentation(
+            title = "That code didn't match",
+            detail = "Your machine answered and rejected this code, so it was wrong or the " +
+                "120-second window had closed. Run `gonomad pair` again and scan the new QR.",
+            actionLabel = "Try again",
+            action = ErrorAction.Retry,
+        )
 
         is GonomadException.Protocol -> when (site) {
             ErrorSite.Pairing -> ErrorPresentation(

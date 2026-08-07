@@ -66,6 +66,9 @@ fn show_identity(daemon: &DeviceIdentity) {
 fn open_pairing_window(daemon: &DeviceIdentity, secret: &PairingSecret) -> String {
     let ticket = PairingTicket {
         daemon_key: daemon.noise_public_key(),
+        // The iroh NodeId: the address off-LAN, since iroh dials public keys
+        // rather than IP addresses (ARCHITECTURE.md §4.3).
+        node_id: daemon.iroh_node_id(),
         addr_hints: vec!["192.168.1.42:41234".into()],
         relay_hint: Some("https://relay.example.com".into()),
     };

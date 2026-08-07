@@ -89,6 +89,20 @@ pub struct PairedDaemon {
     /// that is tedious to diagnose from the wire (`gonomad_core::identity`).
     pub noise_key: PublicKey,
 
+    /// The daemon's iroh `NodeId`.
+    ///
+    /// A *transport address*, not a credential — iroh dials by public key rather
+    /// than by IP, which is what lets this phone reach the machine from any
+    /// network without a port forward (`ARCHITECTURE.md` §4.3). Stored because
+    /// without it a reconnect has nothing to dial: address hints go stale the
+    /// moment either side changes network, whereas the `NodeId` never does.
+    ///
+    /// Deliberately separate from [`PairedDaemon::noise_key`]. The Noise key is
+    /// the credential the session authenticates against; conflating the two would
+    /// tie the security model to one transport, which §3.4 declines to do.
+    #[serde(default)]
+    pub node_id: Option<PublicKey>,
+
     /// How the *daemon* is identified in the UI, as hex.
     ///
     /// The hex of [`PairedDaemon::noise_key`], not a `DeviceId`. A `DeviceId` is
@@ -368,6 +382,9 @@ mod tests {
     fn daemon() -> PairedDaemon {
         PairedDaemon {
             noise_key: PublicKey::from_bytes([0xAB; 32]),
+            // A distinct value from the Noise key, so a test that accidentally
+            // swapped the two would fail rather than pass by coincidence.
+            node_id: Some(PublicKey::from_bytes([0xCD; 32])),
             device_id: "a".repeat(64),
             registered_device_id: "b".repeat(64),
             name: "DESKTOP-ABC".into(),

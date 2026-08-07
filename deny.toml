@@ -194,6 +194,43 @@ ignore = true
 # for the global `allow` list, so cargo-deny will start warning that the global
 # allowance is unused. That is expected, not a bug.
 
+# --- CDLA-Permissive-2.0, scoped to the two webpki root-store crates ------
+# These arrive with the transport: iroh -> iroh-relay -> webpki-roots. They are
+# not optional, because a relay is reached over HTTPS and something has to hold
+# the trust anchors.
+#
+# CDLA-Permissive-2.0 ("Community Data License Agreement") is a *data* licence,
+# which is the right shape for what these crates are: a generated Rust file
+# containing Mozilla's CA root certificates and nothing else. No executable
+# logic, no reciprocity obligation, and §2 grants unlimited redistribution of
+# the data in source or compiled form. It is permissive in the plain sense and
+# compatible with shipping an Apache-2.0 binary.
+#
+# Scoped as an exception rather than added to the global `allow` list on
+# purpose: this term is acceptable *for bundled certificate data*. If it ever
+# shows up on a crate containing real code, that should fail CI and be reviewed
+# on its own merits rather than sail through on this precedent.
+#
+# Worth knowing for the threat model (§3.4): GoNomad's own security does not
+# rest on these roots. The Noise IK session runs inside the QUIC stream, so a
+# mis-issued certificate buys a relay operator nothing but ciphertext. The trust
+# anchors protect the relay handshake, not the user's data.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+# DELIBERATELY UNMATCHED TODAY — do not delete as cruft. cargo-deny reports this
+# exception as unencountered because `webpki-root-certs` reaches the graph through
+# rustls-platform-verifier -> reqwest -> iroh only on targets that are neither
+# windows-msvc nor linux-gnu, and `[graph].targets` lists only those two. It
+# starts matching the moment the `aarch64-linux-android` or macOS triples land
+# (see the `[graph]` comment), which is the same reason the `0BSD` and
+# `Unicode-DFS-2016` allowances above are also unmatched. Forward-looking, not
+# stale. `webpki-roots` (no `-certs`) is reachable today via iroh-relay.
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 # --- Clarifications -------------------------------------------------------
 # Some crates have licence metadata that an SPDX parser cannot act on: a
 # missing `license` field, a compound "MIT AND ISC AND OpenSSL" that is really
@@ -202,27 +239,32 @@ ignore = true
 # licence files ourselves; this expression is the answer", and pins the file
 # hash so the answer is invalidated if the text ever changes.
 #
-# `ring` is the canonical case and it WILL enter this graph: it arrives under
-# rustls/quinn/iroh when `gonomad-transport` lands at M1. It is pre-declared
-# here so that the day it appears, CI fails on a licence *decision* we have not
-# made yet rather than on a parser confusion we already understand.
+# RESOLVED: `ring` has landed (0.17.14, via iroh -> quinn -> rustls) and it needs
+# no clarification at all. This file previously carried a pre-emptive
+# `[[licenses.clarify]]` asserting `MIT AND ISC AND OpenSSL`, written against
+# ring 0.16. That prediction was wrong in the good direction: ring 0.17 declares
 #
-# When ring does land:
-#   1. cargo-deny will report the actual LICENSE hash if the one below is
-#      stale — read the licence file yourself before pasting the new number.
-#   2. ring's expression contains the `OpenSSL` term. That term is NOT in the
-#      `allow` list above, deliberately. Adding it is a real legal decision
-#      (advertising-clause-adjacent, Apache-2.0-incompatible in the FSF's
-#      reading of OpenSSL 1.x), so it must be made explicitly, in review,
-#      preferably as an `[[licenses.exceptions]]` entry scoped to ring alone.
-#   3. Note this is unrelated to the `openssl-sys` ban further down: that ban
-#      is about not linking a *system* OpenSSL, not about licence text.
-[[licenses.clarify]]
-crate = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [
-    { path = "LICENSE", hash = 0xbd0eed23 },
-]
+#     license = "Apache-2.0 AND ISC"
+#
+# in its own manifest, and both terms are in the `allow` list, so it passes on
+# metadata alone. The OpenSSL-licensed assembly that motivated the old
+# expression is no longer part of what ring ships.
+#
+# The stale clarification was actively harmful and not merely redundant: a
+# clarify *overrides* crate metadata, so it would have forced the denied
+# `OpenSSL` term onto a crate that no longer carries it and failed the licence
+# check over a term nothing in the graph actually uses. Deleted rather than
+# corrected — there is nothing left to clarify.
+#
+# Unrelated to the `openssl-sys` ban further down, which is about refusing to
+# link a *system* OpenSSL and still applies.
+#
+# No clarifications are needed today. The shape, for when one is:
+#
+#   [[licenses.clarify]]
+#   crate = "some-crate"
+#   expression = "MIT AND ISC"
+#   license-files = [{ path = "LICENSE", hash = 0x00000000 }]
 
 # ---------------------------------------------------------------------------
 # Bans — crates we refuse, and duplicate-version hygiene.
@@ -269,8 +311,12 @@ deny = [
 # --- Duplicate-version escape hatch --------------------------------------
 # Every entry should be temporary and should say what unblocks its removal.
 # Keeping this list short is a maintenance task, not a formality.
-# Two ecosystem-wide migrations account for every entry below. They are not
-# GoNomad's doing and cannot be fixed here; they resolve when upstream crates
+#
+# Five root causes account for every entry below, and each gets its own block:
+# the syn 2 -> 3 transition, uniffi's stale build-time pins, the rand/getrandom
+# split, RustCrypto's digest 0.11 / crypto-common 0.2 major, and the
+# ed25519-dalek 2 vs 3 split that arrived with iroh. Only the last of those is
+# fixable from inside this repository; the rest resolve when upstream crates
 # publish updated releases. Recheck this list whenever a dependency is bumped,
 # and delete entries that no longer apply — `cargo deny check bans` reports an
 # unused skip, so a stale entry is visible rather than silent.
@@ -289,28 +335,98 @@ skip = [
     { crate = "bitflags@1", reason = "reached through uniffi's build-time graph; the workspace and portable-pty are on bitflags 2." },
     { crate = "windows-sys@0.48", reason = "windows-sys 0.48 arrives through uniffi's build-time graph; the daemon's own Windows surface (portable-pty, rusqlite, tokio) is on 0.61." },
 
-    # --- the rand / getrandom 0.6 -> 0.9 split ----------------------------
-    # One root cause, five symptoms. The RustCrypto stack (snow, ed25519-dalek,
-    # aes-gcm, chacha20poly1305, sha2 — everything reached through
-    # `crypto-common`) is still on the rand_core 0.6 / getrandom 0.2 line,
-    # while proptest and tempfile have moved to rand 0.9 / getrandom 0.3-0.4.
-    # This is the single most common duplicate in the Rust ecosystem right now
-    # and there is no action available to us other than waiting for RustCrypto
-    # to release its next major. Revisit when `crypto-common` 0.2 ships: it
-    # should collapse all five of these at once.
-    { crate = "rand@0.8", reason = "rand/getrandom split: gonomad-core's dev-dependency chain and the RustCrypto stack are on rand 0.8; proptest is on rand 0.9." },
-    { crate = "rand_chacha@0.3", reason = "rand/getrandom split: pulled by rand 0.8." },
-    { crate = "rand_core@0.6", reason = "rand/getrandom split: required by snow, ed25519-dalek and everything under crypto-common. This is the load-bearing one — the crypto crates cannot move until RustCrypto does." },
-    { crate = "getrandom@0.2", reason = "rand/getrandom split: pulled by rand_core 0.6." },
-    { crate = "getrandom@0.3", reason = "rand/getrandom split: pulled by rand_core 0.9 (proptest). tempfile is already on getrandom 0.4, hence three concurrent majors." },
+    # --- the rand / getrandom split (0.6 -> 0.8 -> 0.9 -> 0.10) -----------
+    # One root cause, seven symptoms, and iroh made it worse rather than
+    # better. Three concurrent majors of `rand` now sit in the graph:
+    #   0.8   snow's rand_core 0.6 line, plus gonomad-core's dev-dependencies
+    #   0.9   proptest 1.11 (and its rand_chacha 0.9 / rand_xorshift 0.4)
+    #   0.10  iroh 1.0 and everything under it — hickory-resolver, portmapper,
+    #         igd-next, noq-proto, tokio-websockets — and the dalek 5 line
+    # …and three of `getrandom` (0.2 under rand_core 0.6, 0.3 under rand_core
+    # 0.9, 0.4 under rand 0.10 and tempfile).
+    #
+    # An earlier version of this comment predicted that `crypto-common` 0.2
+    # would collapse the whole thing at once. crypto-common 0.2 has now shipped
+    # and is in the graph (under digest 0.11, via iroh's ed25519-dalek 3), and
+    # it did the opposite: it opened a third front rather than merging the
+    # first two, because snow is pinned to the old line and cannot follow. See
+    # the RustCrypto block below for that half.
+    #
+    # Nothing here is actionable from this repository. The 0.8/0.6/0.2 tier
+    # dies when snow releases against rand_core 0.10; the 0.9/0.3 tier dies
+    # when proptest releases against rand 0.10.
+    { crate = "rand@0.8", reason = "rand/getrandom split: gonomad-core's dev-dependency chain and the RustCrypto stack under snow are on rand 0.8; proptest is on 0.9 and iroh's DNS/NAT-traversal stack is on 0.10. Needs the snow bump." },
+    { crate = "rand@0.9", reason = "rand/getrandom split: the middle of the three majors. proptest 1.11 pulls rand 0.9, while iroh 1.0 (hickory-resolver, portmapper, igd-next, noq-proto, tokio-websockets) is on rand 0.10. Dev/test-only on the 0.9 side; removable as soon as proptest publishes against rand 0.10." },
+    { crate = "rand_chacha@0.3", reason = "rand/getrandom split: pulled by rand 0.8. proptest's rand 0.9 is on rand_chacha 0.9, and rand 0.10 dropped rand_chacha for a direct chacha20 dependency, so skipping 0.3 leaves exactly one version." },
+    { crate = "rand_core@0.6", reason = "rand/getrandom split: required by snow, ed25519-dalek 2 and everything under crypto-common 0.1. This is the load-bearing one — the old crypto line cannot move until snow does." },
+    { crate = "rand_core@0.9", reason = "rand/getrandom split: the middle rand_core, reached only through proptest (rand 0.9, rand_chacha 0.9, rand_xorshift 0.4). iroh's rand 0.10 and the curve25519-dalek 5 / signature 3 line are already on rand_core 0.10. Dies with the proptest bump, independently of snow." },
+    { crate = "getrandom@0.2", reason = "rand/getrandom split: pulled by rand_core 0.6, so it is the snow tier again." },
+    { crate = "getrandom@0.3", reason = "rand/getrandom split: pulled by rand_core 0.9 (proptest). tempfile and rand 0.10 are already on getrandom 0.4, hence three concurrent majors." },
+
+    # --- RustCrypto's next major: digest 0.11 / crypto-common 0.2 ---------
+    # iroh 1.0 depends on ed25519-dalek 3, which is built on the *new*
+    # RustCrypto core: digest 0.11, crypto-common 0.2, block-buffer 0.12,
+    # sha2 0.11, curve25519-dalek 5. gonomad-core's own crypto sits on the
+    # previous line and is pinned there by `snow` 0.9.6, whose manifest asks
+    # for curve25519-dalek "4", sha2 "0.10", blake2 "0.10", aes-gcm "0.10",
+    # chacha20poly1305 "0.10" and rand_core "0.6". Noise IK is the transport's
+    # session layer (ARCHITECTURE.md §3.4), so snow is not optional, and no
+    # released snow targets the new core.
+    #
+    # Unlike the uniffi block above, these are real second copies in the
+    # shipped daemon rather than build-time paths. That is a code-size cost,
+    # not a correctness one: none of these crates carries global state, and the
+    # two halves never exchange types — the Noise session keys and iroh's node
+    # identity are separate key material that never meets in a signature.
+    #
+    # Unblocked by exactly one upstream event: a snow release built on
+    # RustCrypto's new core (mcginty/snow). When that lands, every entry in
+    # this block should be deletable in a single commit. Bumping gonomad-core's
+    # own ed25519-dalek does NOT help here — see the next block for why.
+    { crate = "block-buffer@0.10", reason = "RustCrypto major: digest 0.10 (snow's blake2/sha2, curve25519-dalek 4, ed25519-dalek 2) buffers through block-buffer 0.10; digest 0.11 under iroh's ed25519-dalek 3 uses 0.12. Goes away with the snow bump." },
+    { crate = "chacha20@0.9", reason = "RustCrypto major, reached from two unrelated directions: chacha20 0.9 is the cipher half of chacha20poly1305 0.10, one of snow's Noise AEADs, and sits on cipher 0.4; chacha20 0.10 arrives as rand 0.10's ChaCha12 core generator for iroh and sits on cipher 0.5 / rand_core 0.10. Needs the snow bump to clear." },
+    { crate = "crypto-common@0.1", reason = "RustCrypto major — this is the actual seam. digest 0.10, cipher 0.4 and universal-hash 0.5 all share crypto-common 0.1, which is everything under snow (blake2, sha2, aes-gcm, chacha20poly1305, poly1305, polyval) plus ed25519-dalek 2 and curve25519-dalek 4. iroh's digest 0.11 pulls crypto-common 0.2. Nothing on the 0.1 side can move until snow does." },
+    { crate = "curve25519-dalek@4", reason = "RustCrypto major: three separate dependents hold the 4.x line — snow (manifest pins \"4\"), x25519-dalek 2.0.1 (gonomad-core's Noise static keypair) and ed25519-dalek 2. iroh's ed25519-dalek 3 and iroh-base are on curve25519-dalek 5. Note this survives an ed25519-dalek bump: snow and x25519-dalek would still hold 4.x on their own." },
+    { crate = "digest@0.10", reason = "RustCrypto major: the trait crate the whole old line implements — blake2, sha2 0.10, curve25519-dalek 4, ed25519-dalek 2. iroh's ed25519-dalek 3 / sha2 0.11 / curve25519-dalek 5 are on digest 0.11. Snow bump clears it." },
+    { crate = "sha2@0.10", reason = "RustCrypto major: snow uses sha2 0.10 for the Noise hash and ed25519-dalek 2 uses it for the signature transcript; ed25519-dalek 3 uses sha2 0.11. snow's pin is the binding constraint here, so this one outlives an ed25519-dalek bump." },
+
+    # --- ed25519-dalek 2 vs 3: the one duplicate we could actually fix -----
+    # gonomad-core signs device identities with ed25519-dalek 2.2.0; iroh 1.0
+    # and iroh-base sign node identities with ed25519-dalek 3.0.0. Unlike
+    # everything above, this is not blocked upstream — ed25519-dalek 3 is
+    # released and nothing in the graph pins us to 2. It is skipped rather than
+    # fixed because the bump touches security-critical key handling
+    # (ARCHITECTURE.md §3.4/§3.6) and deserves its own reviewed commit instead
+    # of riding along with a lockfile change.
+    #
+    # Worth knowing before doing it: the bump collapses exactly these three
+    # entries and nothing else. curve25519-dalek, sha2, digest, crypto-common
+    # and block-buffer stay duplicated regardless, because snow 0.9.6 and
+    # x25519-dalek 2.0.1 hold the old line independently of ed25519-dalek.
+    # Delete this whole block — and only this block — when that lands.
+    { crate = "ed25519@2", reason = "ed25519-dalek split: the signature-encoding crate under gonomad-core's ed25519-dalek 2.2.0; iroh's ed25519-dalek 3 pulls ed25519 3.0.0. Removed by bumping gonomad-core to ed25519-dalek 3." },
+    { crate = "ed25519-dalek@2", reason = "ed25519-dalek split: gonomad-core's device identity keys are on 2.2.0 while iroh 1.0 and iroh-base are on 3.0.0. The only entry in this file that is fixable from inside the repository rather than by an upstream release; deferred to a dedicated commit because it rewrites identity key handling." },
+    { crate = "signature@2", reason = "ed25519-dalek split: the trait crate beneath ed25519 2.2.3; ed25519 3.0.0 is on signature 3.0.0. Same one-line fix as the two entries above." },
 
     # --- misc -------------------------------------------------------------
     { crate = "cpufeatures@0.2", reason = "blake3 is on cpufeatures 0.3; the RustCrypto crates (aes, chacha20, curve25519-dalek, poly1305, polyval, sha2) are on 0.2. Runtime CPU-feature detection only — no shared state, so two copies are harmless. Remove when RustCrypto bumps." },
+    { crate = "hashbrown@0.14", reason = "rusqlite 0.32 -> hashlink 0.9 pins hashbrown 0.14 for its prepared-statement LRU cache; iroh's half of the graph is on 0.17 (indexmap 2.14 under hyper/h2/toml_edit, and lru 0.18 under iroh-relay). Not crypto and not shared state — two hash-table implementations coexist harmlessly. Unblocked by a rusqlite bump, which is a gonomad-store change; check it the next time the store schema work opens that crate (plan.md M2)." },
 ]
 
 # `skip-tree` skips a crate AND everything below it. It is a much bigger hammer
 # than `skip` — a whole subtree stops being deduplicated — so it stays empty
 # unless a single dependency drags in an entire parallel ecosystem version.
+#
+# iroh was weighed against that bar when it landed and does not clear it. It
+# roughly doubled the graph (254 -> 524 crates) and it does bring a second copy
+# of the RustCrypto core, which superficially looks like "a parallel ecosystem
+# version". But it is the *newer* half of a split whose older half we own: the
+# duplication exists because gonomad-core is behind, not because iroh vendored
+# its own universe. A `skip-tree = ["iroh"]` would silence roughly a dozen
+# duplicates in one line and, worse, would keep silencing them after snow and
+# ed25519-dalek are bumped — the exact moment we want CI to tell us the skips
+# are now unused. The individually-listed entries above cost more lines and buy
+# a working ratchet.
 skip-tree = []
 
 # --- Build-time code execution -------------------------------------------

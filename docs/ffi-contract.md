@@ -78,9 +78,17 @@ sealed class GonomadError : Exception() {
     data class Unsupported(val feature: String) : GonomadError()
     data class Transport(val detail: String) : GonomadError()
     data class Protocol(val detail: String) : GonomadError()
+    object PairingRejected : GonomadError()
     object NotPaired : GonomadError()
 }
 ```
+
+`PairingRejected` and `Transport` are both reachable from a failed pairing and must
+not be presented alike. `PairingRejected` means the machine answered and turned the
+code down — rescanning is the fix. `Transport` means nothing answered, so the code
+was never even checked; telling the user to re-read their six digits is actively
+misleading. The split exists because the two were conflated once and it cost real
+debugging time.
 
 ## The client object
 

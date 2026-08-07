@@ -162,6 +162,17 @@ pub enum TransportError {
     #[error("no address hint could be reached")]
     NoReachableAddress,
 
+    /// The hints carried no usable iroh `NodeId`.
+    ///
+    /// Distinct from [`TransportError::NoReachableAddress`] because the two send a
+    /// user in opposite directions: that one means "the network would not carry
+    /// us", this one means "the pairing code did not say who to call" — a stale QR,
+    /// a ticket from a daemon predating [`crate::AddrHint::Node`], or 32 bytes that
+    /// are not a valid Ed25519 point. Re-pairing fixes it; hunting for a firewall
+    /// does not.
+    #[error("no iroh node id was supplied, so there is no peer to dial")]
+    NoNodeId,
+
     /// The Noise handshake did not complete.
     ///
     /// Deliberately does not say why. See the module documentation.

@@ -140,12 +140,47 @@ async fn cmd_pair(paths: &state::Paths, workspace: Option<PathBuf>) -> Result<()
     let workspace = resolve_workspace(workspace)?;
 
     let secret = PairingSecret::generate();
-    let addrs = local_addresses();
+
+    let store = gonomad_store::Store::open(&paths.database)
+        .context("could not open the device database")?;
+    let daemon = build_daemon(&workspace)?;
+
+    // Bind BEFORE building the ticket. The hints a QR pins have to describe an
+    // endpoint that exists: iroh chooses its own UDP port, so the only way to
+    // advertise a reachable address is to ask the bound endpoint for it. The
+    // previous version called `local_addresses()`, which guessed the interface
+    // correctly but hard-coded port 41234 — a port nothing was listening on. Those
+    // hints could never succeed, so every same-network pairing silently fell
+    // through to hole-punching or a relay instead of taking the fast LAN path.
+    let transport = serve::bind_pairing_iroh(std::sync::Arc::clone(&identity), &secret).await?;
+
+    // Wait for a relay before advertising one, so the ticket cannot pin a relay
+    // the endpoint has not settled on yet.
+    transport.online().await;
+
+    // The NodeId is what makes the phone reachable off-LAN: iroh dials by public
+    // key and finds a path itself, so this is the field that turns "same Wi-Fi
+    // only" into "any network". The direct addresses stay as hints because they
+    // make the same-network case fast, but they are no longer what pairing depends
+    // on. `addr_hints` also carries the relay URL, which is what lets a phone on
+    // mobile data reach a machine behind CGNAT on the very first attempt.
+    let hints = transport.addr_hints();
+    let addrs: Vec<String> = hints
+        .iter()
+        .filter_map(|hint| hint.socket_addr().map(|addr| addr.to_string()))
+        .collect();
+    // `AddrHint` is `#[non_exhaustive]`, so a wildcard is required. A hint kind
+    // this build does not know about is not a relay, which is the safe reading.
+    let relay_hint = hints.iter().find_map(|hint| match hint {
+        gonomad_transport::AddrHint::Relay(url) => Some(url.clone()),
+        _ => None,
+    });
 
     let ticket = PairingTicket {
         daemon_key: identity.noise_public_key(),
+        node_id: identity.iroh_node_id(),
         addr_hints: addrs.clone(),
-        relay_hint: None,
+        relay_hint: relay_hint.clone(),
     };
     let payload = ticket.encode(&secret);
 
@@ -161,6 +196,10 @@ async fn cmd_pair(paths: &state::Paths, workspace: Option<PathBuf>) -> Result<()
             addrs.join(", ")
         }
     );
+    println!(
+        "  relay         {}",
+        relay_hint.as_deref().unwrap_or("none — direct only")
+    );
     println!("  manual code   {}", ManualCode::from_secret(&secret));
     println!("  valid for     120 seconds, single use");
     println!();
@@ -169,16 +208,15 @@ async fn cmd_pair(paths: &state::Paths, workspace: Option<PathBuf>) -> Result<()
     println!();
     println!("Waiting for a device…  (Ctrl-C to cancel)");
     println!();
-    println!("If nothing happens after scanning, it is almost certainly the local");
-    println!("firewall rather than the code — run `gonomad doctor` for the one-line fix.");
+    println!("Your phone does not need to be on this network. If nothing happens after");
+    println!("scanning, check the phone has internet at all — run `gonomad doctor` too.");
 
-    let store = gonomad_store::Store::open(&paths.database)
-        .context("could not open the device database")?;
-    let daemon = build_daemon(&workspace)?;
-
-    let device = serve::serve_pairing(
-        identity,
-        &secret,
+    // The endpoint is already bound and already advertised in the QR above, so this
+    // only waits for a device on it (ARCHITECTURE.md §4.2 Tiers 1–2). The TCP
+    // binding remains available and is marginally faster on a LAN, but making it
+    // the default here is what made pairing fail off-network.
+    let device = serve::run_pairing_iroh(
+        &transport,
         daemon,
         &store,
         std::time::Duration::from_millis(gonomad_core::PAIRING_WINDOW_MS),
@@ -201,14 +239,18 @@ async fn cmd_serve(paths: &state::Paths, workspace: Option<PathBuf>, port: u16) 
 
     println!("GoNomad serving");
     println!("  workspace   {}", workspace.display());
-    println!("  addresses   {}", local_addresses().join(", "));
     println!("  identity    {}", identity.noise_public_key().short());
+    println!("  reachable   any network — hole-punched, with a relay fallback");
     println!();
     println!("{}", state::KEY_STORAGE_WARNING);
     println!();
     println!("Ctrl-C to stop.");
+    println!();
 
-    serve::serve(identity, daemon, store, port).await
+    // `port` is only meaningful to the Tier 0 TCP binding. iroh picks its own
+    // UDP port and does not need an inbound rule, which is the whole point.
+    let _ = port;
+    serve::serve_iroh(identity, daemon, store).await
 }
 
 fn cmd_devices(paths: &state::Paths) -> Result<()> {

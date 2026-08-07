@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
-use gonomad_core::{DeviceIdentity, PairingError, PairingTicket, Sas};
+use gonomad_core::{DeviceIdentity, PairingError, PairingTicket, Purpose, Sas};
 use gonomad_proto::methods::{
     method, DirEntry, Empty, FsListParams, FsListResult, FsReadParams, FsReadResult, PtyIdParams,
     PtyInputParams, PtyListResult, PtyResizeParams, PtySpawnParams, PtySpawnResult, ScreenFrame,
@@ -49,13 +49,14 @@ use gonomad_proto::{
     RejectReason, Request, Response, ResponseBody, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use gonomad_transport::{
-    AddrHint, ClientConfig, MuxConfig, PeerId, RecvStream, SendStream, TcpConnection, TcpTransport,
+    AddrHint, IrohConfig, IrohConnection, IrohTransport, MuxConfig, PeerId, RecvStream, SendStream,
     Tier, TransportError,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 use crate::storage::{now_ms, PairedDaemon, Storage, StorageError};
 
@@ -141,6 +142,22 @@ pub enum ClientError {
     /// The transport failed.
     #[error(transparent)]
     Transport(#[from] TransportError),
+
+    /// The pairing handshake was rejected, which is what a wrong or expired
+    /// pairing code looks like from this side.
+    ///
+    /// Split out of [`ClientError::Transport`] because the two send a user in
+    /// opposite directions and only one of them is about the code. IKpsk2 mixes
+    /// the pairing secret into the *responder's* message (`ARCHITECTURE.md` §19
+    /// R24), so a wrong code fails exactly where this side authenticates that
+    /// message. Being unable to reach the machine at all — different network, no
+    /// route, asleep — fails earlier and stays a `Transport` error.
+    ///
+    /// Conflating them is not a cosmetic problem: it tells someone whose phone is
+    /// simply on mobile data to go re-read a six-digit code, which is the one
+    /// thing that cannot help them.
+    #[error("the machine rejected the pairing handshake")]
+    PairingRejected,
 
     /// The scanned QR payload was not a usable pairing ticket.
     #[error(transparent)]
@@ -328,8 +345,23 @@ impl PendingMap {
 
 /// One live control stream and the machinery around it.
 struct Live {
+    /// The iroh endpoint `conn` lives on, which is why it is held here rather
+    /// than left in `establish`.
+    ///
+    /// iroh's endpoint tears down every connection on it when dropped — and it
+    /// does so *ungracefully*, with only a `tracing::error!` to say so. Letting
+    /// it fall out of scope at the end of `establish` therefore killed the
+    /// connection milliseconds after `connect` returned, which read as a random
+    /// `ConnectionLost` on the first request rather than as a lifetime bug.
+    ///
+    /// `Arc` because `Drop` has to move it into a task to close it politely.
+    transport: Arc<IrohTransport>,
+    /// The runtime the endpoint's sockets and timers were created on, so `Drop`
+    /// can close the endpoint there. Captured rather than looked up at drop time:
+    /// `disconnect()` can arrive from a Kotlin thread with no runtime in scope.
+    runtime: tokio::runtime::Handle,
     /// Owns the multiplexer, so this must outlive every stream taken from it.
-    conn: TcpConnection,
+    conn: IrohConnection,
     /// The send half. A tokio mutex because `send` parks on flow-control credit,
     /// and holding a `std` guard across that await would block a worker thread.
     tx: Arc<tokio::sync::Mutex<SendStream>>,
@@ -344,11 +376,22 @@ struct Live {
 
 impl Live {
     /// Spawns the reader task and assembles the connection.
-    fn start(conn: TcpConnection, tx: SendStream, rx: RecvStream, hello: HelloOk) -> Self {
+    ///
+    /// Must be called from inside the client's runtime: it spawns the reader task
+    /// and records the runtime handle the endpoint will later be closed on.
+    fn start(
+        transport: Arc<IrohTransport>,
+        conn: IrohConnection,
+        tx: SendStream,
+        rx: RecvStream,
+        hello: HelloOk,
+    ) -> Self {
         let tx = Arc::new(tokio::sync::Mutex::new(tx));
         let pending = Arc::new(PendingMap::default());
         let reader = tokio::spawn(route_control(rx, Arc::clone(&tx), Arc::clone(&pending)));
         Self {
+            transport,
+            runtime: tokio::runtime::Handle::current(),
             conn,
             tx,
             pending,
@@ -415,6 +458,13 @@ impl Drop for Live {
     fn drop(&mut self) {
         self.reader.abort();
         self.conn.close();
+        // Then the endpoint the connection lived on. Closed on the runtime rather
+        // than dropped here, because a bare drop makes iroh abort ungracefully and
+        // leaves the daemon to notice the loss on an idle timeout instead of being
+        // told. Best-effort by nature: if the runtime is already shutting down the
+        // task is discarded, which is the same outcome a bare drop would give.
+        let transport = Arc::clone(&self.transport);
+        self.runtime.spawn(async move { transport.close().await });
     }
 }
 
@@ -429,6 +479,11 @@ struct Pairing {
     /// The daemon's Noise static key, as authenticated by the handshake rather
     /// than as claimed by the QR.
     peer: PublicKey,
+    /// The daemon's iroh `NodeId`, carried through so `confirm_pairing` can
+    /// persist it. Without it a later reconnect has nothing durable to dial:
+    /// address hints go stale the moment either side changes network, while a
+    /// `NodeId` never does.
+    node_id: PublicKey,
     addr_hints: Vec<String>,
 }
 
@@ -554,15 +609,26 @@ impl Inner {
         }
         self.set_phase(ConnPhase::Connecting);
 
-        let hints: Vec<AddrHint> = daemon
-            .addr_hints
-            .iter()
-            .map(|h| AddrHint::parse(h))
-            .collect();
-        let config = ClientConfig::reconnect(Arc::clone(&self.identity));
+        // The NodeId comes first: it is the only hint that survives either side
+        // changing network, and iroh cannot dial without it. Address hints follow
+        // because they still make the same-network case fast.
+        let mut hints: Vec<AddrHint> = Vec::new();
+        if let Some(node_id) = daemon.node_id {
+            hints.push(AddrHint::Node(node_id));
+        }
+        hints.extend(daemon.addr_hints.iter().map(|h| AddrHint::parse(h)));
+
         let peer = PeerId::from_noise_key(daemon.noise_key);
 
-        match establish(config, peer, &hints).await {
+        match establish(
+            Arc::clone(&self.identity),
+            Purpose::Reconnect,
+            None,
+            peer,
+            &hints,
+        )
+        .await
+        {
             Ok(live) => {
                 self.adopt(live, &daemon);
                 Ok(())
@@ -631,7 +697,7 @@ impl Inner {
         self.set_phase(ConnPhase::Connecting);
 
         let hints = AddrHint::from_ticket(&ticket);
-        let config = ClientConfig::pairing(Arc::clone(&self.identity), &secret);
+
         let peer = PeerId::from_noise_key(ticket.daemon_key);
 
         // A wrong pairing code fails here, when the initiator authenticates the
@@ -639,13 +705,31 @@ impl Inner {
         // and nothing will be: the only writer is `confirm_pairing` (§19 R24).
         // `map_err` rather than `inspect_err`, which needs Rust 1.76 and the
         // workspace MSRV is 1.75.
-        let live = establish(config, peer, &hints).await.map_err(|err| {
+        let live = establish(
+            Arc::clone(&self.identity),
+            Purpose::Pairing,
+            Some(Zeroizing::new(*secret.as_bytes())),
+            peer,
+            &hints,
+        )
+        .await
+        .map_err(|err| {
             self.set_phase(if self.paired_daemon().is_some() {
                 ConnPhase::Disconnected
             } else {
                 ConnPhase::Unpaired
             });
-            err
+            // Only a *handshake* failure is evidence about the code. Everything
+            // else — no route, no node id in the ticket, the endpoint would not
+            // bind — is evidence about the network, and saying "wrong code" to
+            // someone who simply changed Wi-Fi sends them hunting for a typo that
+            // is not there.
+            match err {
+                ClientError::Transport(TransportError::HandshakeFailed) => {
+                    ClientError::PairingRejected
+                }
+                other => other,
+            }
         })?;
 
         let sas = *live.conn.sas();
@@ -654,6 +738,7 @@ impl Inner {
             live: Arc::new(live),
             sas,
             peer,
+            node_id: ticket.node_id,
             addr_hints: ticket.addr_hints,
         });
         Ok(sas.grouped())
@@ -668,13 +753,14 @@ impl Inner {
     /// right pre-shared key — proves the phone saw the QR. Persisting before the
     /// round trip would remember a machine that never accepted us.
     async fn confirm_pairing(&self, device_name: &str) -> Result<(), ClientError> {
-        let (live, sas, peer, addr_hints) = {
+        let (live, sas, peer, node_id, addr_hints) = {
             let pairing = lock(&self.pairing);
             let pairing = pairing.as_ref().ok_or(ClientError::NoPairingInProgress)?;
             (
                 Arc::clone(&pairing.live),
                 pairing.sas,
                 pairing.peer,
+                pairing.node_id,
                 pairing.addr_hints.clone(),
             )
         };
@@ -699,6 +785,9 @@ impl Inner {
         let name = daemon_name(&live, &addr_hints, self.request_timeout()).await;
         let daemon = PairedDaemon {
             noise_key: peer,
+            // From the ticket: without it a later reconnect has nothing durable to
+            // dial, since address hints go stale the moment either side moves.
+            node_id: Some(node_id),
             // The record describes the *machine*, so its identifier is the
             // machine's key — not the id the daemon assigned this phone, which is
             // kept alongside it.
@@ -812,20 +901,47 @@ impl Inner {
 }
 
 /// Dials, opens the control stream, and completes the hello exchange.
+///
+/// Dials over **iroh**, not the TCP binding. That is what lets the phone reach
+/// the machine when the two are on different networks — mobile data to a laptop
+/// behind a home router, with no port forwarding (`ARCHITECTURE.md` §4.2, Tiers
+/// 1–2). iroh tries the pinned direct addresses from the QR first, so the
+/// same-network case stays fast, then hole-punches, then falls back to a relay.
+///
+/// The relay only ever carries ciphertext: the Noise IK session runs *inside* the
+/// QUIC stream, which is precisely why a public relay is acceptable (§3.4).
 async fn establish(
-    config: ClientConfig,
+    identity: Arc<DeviceIdentity>,
+    purpose: Purpose,
+    psk: Option<Zeroizing<[u8; 32]>>,
     peer: PeerId,
     hints: &[AddrHint],
 ) -> Result<Live, ClientError> {
-    // Read before the config is moved into the transport. This is the **Ed25519
-    // signing key**: the daemon registers it and later verifies presence
-    // signatures against it. The X25519 Noise key authenticated the socket and is
-    // a different value entirely (`gonomad_core::identity`).
-    let device_key = config.identity.public_key();
+    // This is the **Ed25519 signing key**: the daemon registers it and later
+    // verifies presence signatures against it. The X25519 Noise key authenticated
+    // the transport and is a different value entirely
+    // (`gonomad_core::identity`), as is the iroh NodeId.
+    let device_key = identity.public_key();
 
-    let transport = TcpTransport::client(config)?;
-    let conn = transport.connect_lan(peer, hints).await?;
-    let (mut tx, mut rx) = conn.open_bi()?;
+    let config = match (purpose, psk) {
+        (Purpose::Pairing, Some(psk)) => {
+            // Rebuild the wiping wrapper the transport's constructor expects. The
+            // bytes are the same secret the QR carried; wrapping them keeps them
+            // zeroed on drop rather than left in a plain array.
+            let secret = gonomad_core::PairingSecret::from_bytes(*psk);
+            IrohConfig::pairing_dialer(identity, &secret)
+        }
+        (Purpose::Reconnect, None) => IrohConfig::dialer(identity),
+        // Unreachable via the public API, but a mismatch here would run the
+        // wrong Noise pattern, so it fails loudly rather than silently.
+        _ => return Err(ClientError::NotPaired),
+    };
+
+    // The endpoint is handed to `Live` below and lives exactly as long as the
+    // connection taken from it. Dropping it here would tear that connection down.
+    let transport = Arc::new(IrohTransport::bind(config).await?);
+    let conn = transport.connect_iroh(peer, hints).await?;
+    let (mut tx, mut rx) = conn.open_stream().await?;
 
     let hello = ControlMessage::Hello(Hello {
         proto_version: PROTOCOL_VERSION,
@@ -847,7 +963,7 @@ async fn establish(
         server = %accepted.server_version,
         "control stream established"
     );
-    Ok(Live::start(conn, tx, rx, accepted))
+    Ok(Live::start(transport, conn, tx, rx, accepted))
 }
 
 /// Reads the control stream until the daemon accepts or refuses the hello.

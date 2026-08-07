@@ -282,6 +282,15 @@ pub enum GonomadError {
         detail: String,
     },
 
+    /// The machine was reached, but it rejected the pairing handshake.
+    ///
+    /// The one error that genuinely means "that code was wrong or expired". It is
+    /// a separate variant rather than a `Transport` with different prose because
+    /// the UI has to offer a different action: rescan a fresh QR, as opposed to
+    /// fixing the network. See [`crate::client::ClientError::PairingRejected`].
+    #[error("the machine rejected the pairing code")]
+    PairingRejected,
+
     /// No machine is paired.
     #[error("not paired")]
     NotPaired,
@@ -293,6 +302,7 @@ impl From<ClientError> for GonomadError {
             ClientError::NotPaired | ClientError::Unpaired => Self::NotPaired,
             ClientError::RateLimited { retry_after_ms } => Self::RateLimited { retry_after_ms },
             ClientError::Remote(remote) => from_remote(remote),
+            ClientError::PairingRejected => Self::PairingRejected,
             ClientError::Transport(transport) => Self::Transport {
                 detail: transport_detail(&transport),
             },
@@ -386,13 +396,23 @@ fn from_remote(remote: gonomad_proto::ProtoError) -> GonomadError {
 /// been given a bug report instead of a next step.
 fn transport_detail(error: &TransportError) -> String {
     match error {
+        // No "check you are on the same Wi-Fi": that advice predates the iroh
+        // transport and is now simply false. Different networks are the designed
+        // case (§4.2 Tiers 1-2) — hole-punched direct QUIC, then a relay — so
+        // pointing at Wi-Fi sends the user to fix something that is not broken.
         TransportError::NoReachableAddress
         | TransportError::Connect { .. }
         | TransportError::Bind { .. } => {
-            "Could not reach your machine. Check it is awake and on the same Wi-Fi."
+            "Could not reach your machine. Check it is awake and GoNomad is running on it."
         }
-        TransportError::HandshakeFailed => {
-            "Could not agree a secure connection. If you are pairing, the code may be wrong."
+        // Says nothing about pairing codes. A handshake failure while *pairing* is
+        // turned into `PairingRejected` before it gets here; reaching this line
+        // means an established device failed to re-authenticate, where a pairing
+        // code is not involved at all.
+        TransportError::HandshakeFailed => "Could not agree a secure connection with your machine.",
+        TransportError::NoNodeId => {
+            "That pairing code does not say which machine to call. Run `gonomad pair` \
+             again and scan the new QR."
         }
         TransportError::PeerNotAuthorized | TransportError::WrongPeer => {
             "That is not the machine this device is paired with."
@@ -802,15 +822,51 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_pairing_code_reads_as_a_pairing_problem() {
-        // The most likely real failure, so the wording has to point at the code.
-        let mapped = GonomadError::from(ClientError::Transport(TransportError::HandshakeFailed));
-        match mapped {
-            GonomadError::Transport { detail } => {
-                assert!(detail.contains("code"), "got {detail:?}");
-            }
-            other => panic!("expected Transport, got {other:?}"),
+    fn a_rejected_pairing_code_is_its_own_error_and_not_a_transport_failure() {
+        // The UI branches on the variant, not on prose, so this is the property
+        // that keeps "rescan the QR" attached to the one cause it fixes.
+        assert_eq!(
+            GonomadError::from(ClientError::PairingRejected),
+            GonomadError::PairingRejected
+        );
+    }
+
+    #[test]
+    fn being_unable_to_reach_the_machine_never_blames_the_pairing_code() {
+        // The regression this guards is a real one that cost real debugging time:
+        // a phone that had merely switched to mobile data was told its pairing
+        // code did not match, so the user went looking for a typo and a firewall
+        // rule instead of at the network. Reachability failures must not mention
+        // the code, and must not send anyone back to the same Wi-Fi — different
+        // networks are the case the transport is built for.
+        let unreachable = [
+            TransportError::NoReachableAddress,
+            TransportError::Connect {
+                addr: "192.0.2.1:9999".parse().expect("literal"),
+                kind: std::io::ErrorKind::TimedOut,
+            },
+            TransportError::Timeout,
+        ];
+        for error in unreachable {
+            let detail = transport_detail(&error);
+            let lowered = detail.to_lowercase();
+            assert!(
+                !lowered.contains("code"),
+                "{error:?} blames the pairing code: {detail:?}"
+            );
+            assert!(
+                !lowered.contains("wi-fi") && !lowered.contains("same network"),
+                "{error:?} tells the user to fix a network that is not the problem: {detail:?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_handshake_failure_outside_pairing_does_not_mention_a_code_either() {
+        // Reached only by an already-paired device failing to re-authenticate,
+        // where there is no pairing code in play to be wrong.
+        let detail = transport_detail(&TransportError::HandshakeFailed);
+        assert!(!detail.to_lowercase().contains("code"), "got {detail:?}");
     }
 
     #[test]

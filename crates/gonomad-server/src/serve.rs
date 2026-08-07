@@ -19,7 +19,9 @@ use anyhow::{bail, Context, Result};
 use gonomad_core::{DeviceIdentity, PairingSecret};
 use gonomad_proto::{ControlMessage, Frame, FrameFlags, PublicKey};
 use gonomad_store::Store;
-use gonomad_transport::{Allowlist, ServerConfig, TcpConnection, TcpTransport, DEFAULT_PORT};
+use gonomad_transport::{
+    Allowlist, Conn, IrohConfig, IrohTransport, ServerConfig, TcpTransport, DEFAULT_PORT,
+};
 
 use crate::router::{Daemon, Effect, Router};
 
@@ -56,6 +58,193 @@ pub async fn serve_pairing(
 ) -> Result<PairedDevice> {
     let transport = bind_pairing(identity, secret, DEFAULT_PORT).await?;
     run_pairing(&transport, daemon, store, window).await
+}
+
+/// Runs one pairing window over iroh, so the phone can be on any network.
+///
+/// The Tier 1/2 counterpart to [`serve_pairing`]. Prefer this: the TCP binding
+/// only works when both machines are on the same LAN, which is the single biggest
+/// limitation of the Tier 0 path (`ARCHITECTURE.md` §4.2).
+///
+/// # Errors
+///
+/// Fails if the iroh endpoint cannot bind, or if the window expires with no
+/// registration.
+pub async fn serve_pairing_iroh(
+    identity: Arc<DeviceIdentity>,
+    secret: &PairingSecret,
+    daemon: Arc<Daemon>,
+    store: &Store,
+    window: Duration,
+) -> Result<(PairedDevice, IrohTransport)> {
+    let transport = bind_pairing_iroh(identity, secret).await?;
+    let device = run_pairing_iroh(&transport, daemon, store, window).await?;
+    Ok((device, transport))
+}
+
+/// Brings up the pairing endpoint without yet waiting for a device.
+///
+/// Split out of [`serve_pairing_iroh`] because a pairing QR has to describe an
+/// endpoint that already exists. The addresses and the relay a ticket pins are
+/// properties of the bound endpoint — [`IrohTransport::addr_hints`] — so binding
+/// has to happen *before* the ticket is built, not as a side effect of starting
+/// to listen. Guessing them instead produces a QR that pins addresses nothing is
+/// listening on.
+///
+/// Callers should await [`IrohTransport::online`] before rendering a ticket, so
+/// the relay hint is the one the endpoint actually settled on.
+///
+/// # Errors
+///
+/// Fails if the iroh endpoint cannot bind.
+pub async fn bind_pairing_iroh(
+    identity: Arc<DeviceIdentity>,
+    secret: &PairingSecret,
+) -> Result<IrohTransport> {
+    IrohTransport::bind(IrohConfig::pairing(identity, secret))
+        .await
+        .context("could not start the iroh endpoint")
+}
+
+/// Accepts iroh connections until a device registers or the window closes.
+///
+/// A failed handshake does not end the window: a wrong code, or a passer-by's QR
+/// scanner, must not cost the user a fresh QR.
+///
+/// # Errors
+///
+/// Fails if the window expires before a device registers, or if the registration
+/// cannot be persisted.
+pub async fn run_pairing_iroh(
+    transport: &IrohTransport,
+    daemon: Arc<Daemon>,
+    store: &Store,
+    window: Duration,
+) -> Result<PairedDevice> {
+    let deadline = tokio::time::Instant::now() + window;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("the pairing window expired before a device registered");
+        }
+
+        let accepted = tokio::time::timeout(remaining, transport.accept_iroh()).await;
+        let conn = match accepted {
+            Err(_) => bail!("the pairing window expired before a device registered"),
+            Ok(Err(e)) => {
+                // A wrong pairing code, or a scanner. Keep waiting rather than
+                // making one bad attempt cost the user a fresh QR.
+                tracing::debug!(error = %e, "pairing attempt failed during handshake");
+                continue;
+            }
+            Ok(Ok(conn)) => conn,
+        };
+
+        let sas = conn.sas().digits();
+        let peer = conn.peer_key();
+        let tier = conn.path_info().tier;
+        tracing::info!(
+            peer = %peer.short(),
+            tier = tier.label(),
+            "pairing handshake completed; awaiting registration"
+        );
+
+        let mut router = Router::pairing(Arc::clone(&daemon), peer, sas);
+        let persist = |key: &PublicKey, name: &str, model: Option<&str>| {
+            store
+                .devices()
+                .pair(
+                    key,
+                    name,
+                    model,
+                    gonomad_proto::CapabilitySet::default_grant(),
+                )
+                .context("could not record the paired device")?;
+            println!();
+            println!("Paired: {name}  ({})", key.short());
+            println!("Connected over {}.", tier.label());
+            println!("This device can now connect from any network. Ctrl-C when you");
+            println!("are done, then run `gonomad serve` for normal use.");
+            Ok(())
+        };
+
+        match serve_connection(&conn, &mut router, persist).await {
+            Ok(Some(device)) => return Ok(device),
+            Ok(None) => tracing::debug!("peer disconnected without registering"),
+            Err(e) => tracing::debug!(error = %e, "pairing connection ended"),
+        }
+    }
+}
+
+/// Serves paired devices over iroh until cancelled.
+///
+/// # Errors
+///
+/// Fails if no device is paired, or if the endpoint cannot bind.
+pub async fn serve_iroh(
+    identity: Arc<DeviceIdentity>,
+    daemon: Arc<Daemon>,
+    store: Store,
+) -> Result<()> {
+    let allowed: Vec<PublicKey> = store
+        .devices()
+        .list_active()
+        .context("could not read the device list")?
+        .iter()
+        .map(|d| d.public_key)
+        .collect();
+
+    if allowed.is_empty() {
+        bail!("no devices are paired — run `gonomad pair` first");
+    }
+
+    let policy = Arc::new(Allowlist::new(allowed.clone()));
+    let transport = IrohTransport::bind(IrohConfig::reconnect(identity, policy))
+        .await
+        .context("could not start the iroh endpoint")?;
+
+    // Wait for the endpoint to learn its own reachability before claiming to be
+    // serving. Without this the first line printed can be a lie: the endpoint
+    // exists but has no relay assigned yet, so a phone dialling immediately fails.
+    transport.online().await;
+
+    println!("  node id     {}", transport.node_id().short());
+    println!("  devices     {}", allowed.len());
+    tracing::info!(devices = allowed.len(), "serving over iroh");
+
+    loop {
+        let conn = match transport.accept_iroh().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::debug!(error = %e, "connection rejected");
+                continue;
+            }
+        };
+
+        let peer = conn.peer_key();
+        let device_id = gonomad_proto::DeviceId::from_public_key(&peer);
+        let grant = gonomad_policy::DeviceGrant::new(
+            device_id,
+            store.devices().grants(&device_id).unwrap_or_default(),
+        );
+
+        tracing::info!(
+            device = %device_id.short(),
+            tier = conn.path_info().tier.label(),
+            "device connected"
+        );
+        let daemon = Arc::clone(&daemon);
+
+        tokio::spawn(async move {
+            let mut router = Router::established(daemon, peer, grant);
+            let no_registration = |_: &PublicKey, _: &str, _: Option<&str>| Ok(());
+            if let Err(e) = serve_connection(&conn, &mut router, no_registration).await {
+                tracing::debug!(error = %e, "connection ended");
+            }
+            tracing::info!(device = %device_id.short(), "device disconnected");
+        });
+    }
 }
 
 /// Binds a pairing listener.
@@ -156,7 +345,7 @@ pub async fn run_pairing(
             Ok(())
         };
 
-        match run_connection(&conn, &mut router, persist).await {
+        match serve_connection(&conn, &mut router, persist).await {
             Ok(Some(device)) => return Ok(device),
             Ok(None) => {
                 tracing::debug!("peer disconnected without registering");
@@ -229,7 +418,7 @@ pub async fn serve(
             // one across an await would make this future non-`Send` and
             // `tokio::spawn` would refuse it.
             let no_registration = |_: &PublicKey, _: &str, _: Option<&str>| Ok(());
-            if let Err(e) = run_connection(&conn, &mut router, no_registration).await {
+            if let Err(e) = serve_connection(&conn, &mut router, no_registration).await {
                 tracing::debug!(error = %e, "connection ended");
             }
             tracing::info!(device = %device_id.short(), "device disconnected");
@@ -246,8 +435,8 @@ pub async fn serve(
 /// the whole future non-`Send` and `tokio::spawn` rejects it. Taking a closure
 /// lets the pairing path (single-threaded, captures the store) and the serving
 /// path (spawned per connection, captures nothing) share this loop.
-async fn run_connection<F>(
-    conn: &TcpConnection,
+async fn serve_connection<F>(
+    conn: &dyn Conn,
     router: &mut Router,
     mut on_register: F,
 ) -> Result<Option<PairedDevice>>

@@ -5,27 +5,51 @@
 //! device connect" (`ARCHITECTURE.md` §3.2). Every connection performs a fresh
 //! mutual authentication from them.
 //!
-//! # One seed, two subkeys
+//! # One seed, three subkeys
 //!
 //! A device has a single 32-byte master seed — one thing to store, back up, and
-//! revoke — from which two independent keypairs are derived with BLAKE3's
+//! revoke — from which three independent keypairs are derived with BLAKE3's
 //! key-derivation mode under distinct contexts:
 //!
 //! | Subkey | Algorithm | Used for |
 //! |---|---|---|
 //! | [`DeviceIdentity::public_key`] | Ed25519 | Detached signatures: presence approvals, audit records |
 //! | [`DeviceIdentity::noise_public_key`] | X25519 | The Noise static key for the session layer |
+//! | [`DeviceIdentity::iroh_node_id`] | Ed25519 | The iroh `NodeId`: the transport-level address a peer is dialled by (§4.3) |
 //!
 //! **These are not interchangeable**, and the distinction is not a stylistic
 //! one: an Ed25519 public key is not a valid X25519 public key even when both
 //! derive from the same bytes, because the two algorithms use different curve
 //! encodings and scalar-clamping rules. Handing a peer an Ed25519 key as a Noise
-//! static simply fails to authenticate. Deriving two subkeys also avoids reusing
-//! one scalar across a signature scheme and a Diffie-Hellman scheme, which is a
-//! construction to stay away from regardless of whether a concrete attack is
-//! known.
+//! static simply fails to authenticate. Deriving separate subkeys also avoids
+//! reusing one scalar across a signature scheme and a Diffie-Hellman scheme,
+//! which is a construction to stay away from regardless of whether a concrete
+//! attack is known.
 //!
-//! Both public keys are registered at pairing.
+//! # Why the iroh key is a third subkey and not the signing key
+//!
+//! The iroh key *is* an Ed25519 keypair, so it could technically be the same one
+//! [`DeviceIdentity::public_key`] uses. It deliberately is not, for the same
+//! reason the first two are split:
+//!
+//! - **One scalar, one job.** The signing subkey produces detached signatures
+//!   over application messages — presence approvals that authorise destructive
+//!   operations (§3.10). The iroh subkey is consumed by a TLS 1.3 handshake that
+//!   signs transcripts we do not choose the shape of. Letting one private scalar
+//!   serve both means an application-level signature and a transport-level
+//!   handshake signature share a key, which is exactly the cross-protocol
+//!   exposure this module's signature domain prefix exists to prevent inside one
+//!   scheme and cannot prevent across two.
+//! - **Independent revocation and rotation.** A future change of transport
+//!   (§4.2 Tier 3) must be able to retire the transport identity without
+//!   invalidating every audit signature this device ever produced.
+//! - **Different disclosure profiles.** A `NodeId` is published to a discovery
+//!   service (DNS or the Mainline DHT, §4.6) and is therefore *deliberately*
+//!   public and enumerable. The signing key's public half is only ever handed to
+//!   a paired daemon. Deriving them separately keeps a decision about publishing
+//!   one from being a decision about the other.
+//!
+//! All three public keys are registered at pairing.
 //!
 //! That design dissolves several problem classes rather than solving them:
 //! there is no token to steal, nothing to rotate on a schedule, no replay of a
@@ -82,6 +106,15 @@ const ED25519_SUBKEY_CONTEXT: &str = "gonomad 2026 device identity ed25519 v1";
 /// BLAKE3 key-derivation context for the X25519 Noise static subkey.
 const X25519_SUBKEY_CONTEXT: &str = "gonomad 2026 device identity x25519 v1";
 
+/// BLAKE3 key-derivation context for the iroh transport subkey.
+///
+/// A third context, not a reuse of [`ED25519_SUBKEY_CONTEXT`], even though both
+/// produce Ed25519 keys. See the module documentation for why one scalar must not
+/// serve both a signature scheme and a transport identity. Changing this string
+/// changes every device's `NodeId`, which un-pairs every phone in the world, so
+/// it is versioned like the others.
+const IROH_SUBKEY_CONTEXT: &str = "gonomad 2026 device identity iroh v1";
+
 /// Errors from identity operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -114,6 +147,13 @@ pub struct DeviceIdentity {
     signing: SigningKey,
     /// X25519, used as the Noise static key for the session layer.
     noise_secret: StaticSecret,
+    /// Ed25519, used as the iroh transport identity. Its public half is the
+    /// `NodeId` peers dial (§4.3).
+    ///
+    /// Held as a `SigningKey` rather than a raw seed so the public half is
+    /// derived by one code path, and because `SigningKey` wipes itself on drop
+    /// under ed25519-dalek's `zeroize` feature.
+    iroh_signing: SigningKey,
     /// Retained so the seed can be re-exported for keyring storage without
     /// reconstructing it, and so it is wiped on drop.
     seed: Zeroizing<[u8; SEED_LEN]>,
@@ -164,9 +204,18 @@ impl DeviceIdentity {
         let noise_seed = Zeroizing::new(blake3::derive_key(X25519_SUBKEY_CONTEXT, seed.as_ref()));
         let noise_secret = StaticSecret::from(*noise_seed);
 
+        // The transport identity. Derived here rather than lazily so that the
+        // `NodeId` is a pure function of the master seed: restoring a daemon from
+        // its recovery phrase (§9.5) must reproduce a *reachable* identity, not
+        // merely an authenticable one, or every paired phone would hold a QR
+        // pointing at a node that no longer exists.
+        let iroh_seed = Zeroizing::new(blake3::derive_key(IROH_SUBKEY_CONTEXT, seed.as_ref()));
+        let iroh_signing = SigningKey::from_bytes(&iroh_seed);
+
         Self {
             signing,
             noise_secret,
+            iroh_signing,
             seed,
         }
     }
@@ -205,6 +254,40 @@ impl DeviceIdentity {
     #[must_use]
     pub fn expose_noise_secret(&self) -> Zeroizing<[u8; SEED_LEN]> {
         Zeroizing::new(self.noise_secret.to_bytes())
+    }
+
+    /// This device's iroh `NodeId` — the value a peer dials it by (§4.3).
+    ///
+    /// An Ed25519 public key, like [`DeviceIdentity::public_key`], but a
+    /// **different** one: see the module documentation for why one scalar does
+    /// not serve both a signature scheme and a transport identity. It is returned
+    /// as a [`PublicKey`] rather than an `iroh::EndpointId` so that this crate
+    /// stays transport-free and compiles into the Android app without pulling in
+    /// a QUIC stack; `gonomad-transport` converts it.
+    ///
+    /// Note that iroh 1.0 renamed this type to `EndpointId`. GoNomad keeps
+    /// calling it a `NodeId` because that is the name `ARCHITECTURE.md` §4.3
+    /// uses, and because renaming a concept in the docs to track an upstream
+    /// rename is churn a reader has to absorb for nothing.
+    ///
+    /// This is the third value the pairing QR carries, alongside
+    /// [`DeviceIdentity::noise_public_key`] and the pairing secret. Without it
+    /// the phone cannot dial the daemon off-LAN at all: iroh addresses peers by
+    /// public key, and no address hint substitutes for the key itself.
+    #[must_use]
+    pub fn iroh_node_id(&self) -> PublicKey {
+        PublicKey::from_bytes(self.iroh_signing.verifying_key().to_bytes())
+    }
+
+    /// Exposes the iroh secret key, for constructing an `iroh::SecretKey`.
+    ///
+    /// Named conspicuously, like [`DeviceIdentity::expose_seed`] and
+    /// [`DeviceIdentity::expose_noise_secret`]: a getter that hands out private
+    /// key material should be impossible to call by accident while reaching for
+    /// the public one. The returned buffer wipes itself on drop.
+    #[must_use]
+    pub fn expose_iroh_secret(&self) -> Zeroizing<[u8; SEED_LEN]> {
+        Zeroizing::new(self.iroh_signing.to_bytes())
     }
 
     /// Exposes the private seed for storage in a platform keyring.
@@ -324,13 +407,71 @@ mod tests {
     }
 
     #[test]
-    fn the_two_private_subkeys_are_independent_of_each_other_and_of_the_seed() {
+    fn the_private_subkeys_are_independent_of_each_other_and_of_the_seed() {
         let id = DeviceIdentity::generate();
         let master = id.expose_seed();
         let noise = id.expose_noise_secret();
-        // Neither subkey may equal the master seed, or compromising one would
-        // hand over everything derived from it.
+        let iroh = id.expose_iroh_secret();
+        // No subkey may equal the master seed, or compromising one would hand
+        // over everything derived from it.
         assert_ne!(noise.as_ref(), master.as_ref());
+        assert_ne!(iroh.as_ref(), master.as_ref());
+        assert_ne!(iroh.as_ref(), noise.as_ref());
+        // Nor may the iroh subkey be the signing subkey: one scalar must not
+        // serve both a signature scheme and a transport identity.
+        assert_ne!(iroh.as_ref(), SigningKey::to_bytes(&id.signing).as_ref());
+    }
+
+    #[test]
+    fn the_iroh_node_id_is_not_the_signing_key_or_the_noise_key() {
+        // Reusing the signing key as the iroh identity would compile, connect,
+        // and pass every functional test — which is precisely why it needs an
+        // assertion rather than a comment.
+        let id = DeviceIdentity::generate();
+        assert_ne!(id.iroh_node_id(), id.public_key());
+        assert_ne!(id.iroh_node_id(), id.noise_public_key());
+    }
+
+    #[test]
+    fn the_iroh_node_id_is_deterministic_from_the_seed() {
+        // Required for the recovery phrase (§9.5): a restored daemon must be
+        // *reachable* at the same NodeId, not merely able to authenticate. A
+        // random transport key would leave every paired phone holding a QR that
+        // points at a node which no longer exists.
+        let seed = [0x11u8; SEED_LEN];
+        assert_eq!(
+            DeviceIdentity::from_seed(seed).iroh_node_id(),
+            DeviceIdentity::from_seed(seed).iroh_node_id()
+        );
+    }
+
+    #[test]
+    fn distinct_seeds_give_distinct_node_ids() {
+        let a = DeviceIdentity::from_seed([1u8; SEED_LEN]);
+        let b = DeviceIdentity::from_seed([2u8; SEED_LEN]);
+        assert_ne!(a.iroh_node_id(), b.iroh_node_id());
+    }
+
+    #[test]
+    fn the_node_id_is_a_valid_ed25519_point() {
+        // iroh parses the NodeId back into a curve point when it dials, so a
+        // derivation that could produce a non-canonical encoding would fail at
+        // connect time rather than here.
+        let id = DeviceIdentity::generate();
+        assert!(VerifyingKey::from_bytes(id.iroh_node_id().as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn the_iroh_secret_reconstructs_the_node_id() {
+        // The round trip `gonomad-transport` relies on: it rebuilds an
+        // `iroh::SecretKey` from these bytes and the endpoint's public identity
+        // must be the NodeId the QR advertised.
+        let id = DeviceIdentity::generate();
+        let rebuilt = SigningKey::from_bytes(&id.expose_iroh_secret());
+        assert_eq!(
+            PublicKey::from_bytes(rebuilt.verifying_key().to_bytes()),
+            id.iroh_node_id()
+        );
     }
 
     #[test]
@@ -461,6 +602,10 @@ mod tests {
             !rendered.contains(&seed_hex),
             "seed leaked into Debug output"
         );
+        assert!(
+            !rendered.contains(&hex::encode(*id.expose_iroh_secret())),
+            "iroh subkey leaked into Debug output"
+        );
         // The public identity is fine to show, and is what makes the output useful.
         assert!(rendered.contains(&id.device_id().short()));
     }
@@ -511,6 +656,19 @@ mod tests {
                 DeviceIdentity::from_seed(a).public_key(),
                 DeviceIdentity::from_seed(b).public_key()
             );
+            proptest::prop_assert_ne!(
+                DeviceIdentity::from_seed(a).iroh_node_id(),
+                DeviceIdentity::from_seed(b).iroh_node_id()
+            );
+        }
+
+        /// Every seed must yield all three subkeys, distinct from one another.
+        #[test]
+        fn any_seed_yields_three_distinct_public_keys(seed: [u8; SEED_LEN]) {
+            let id = DeviceIdentity::from_seed(seed);
+            proptest::prop_assert_ne!(id.public_key(), id.noise_public_key());
+            proptest::prop_assert_ne!(id.public_key(), id.iroh_node_id());
+            proptest::prop_assert_ne!(id.noise_public_key(), id.iroh_node_id());
         }
     }
 }

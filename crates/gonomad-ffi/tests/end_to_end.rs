@@ -1,11 +1,29 @@
-//! End-to-end tests against a stub daemon over a real socket.
+//! End-to-end tests against a stub daemon over a real iroh endpoint.
 //!
-//! Nothing here is mocked below the client's own API: every test binds a
-//! [`TcpTransport`] on `127.0.0.1:0`, runs a real Noise IK handshake, and speaks
-//! the real §10.3 framing over the real multiplexer. That is the point — the
-//! interesting failures in this crate are ordering and lifetime failures between
-//! the reader task, the mux, and the runtime, and a fake transport would hide
-//! every one of them.
+//! Nothing here is mocked below the client's own API: every test binds a real
+//! [`IrohTransport`] on loopback, runs a real Noise IK handshake over real QUIC,
+//! and speaks the real §10.3 framing. That is the point — the interesting
+//! failures in this crate are ordering and lifetime failures between the reader
+//! task, the connection and the runtime, and a fake transport would hide every
+//! one of them. It is also the transport that actually ships: `establish()` dials
+//! over iroh so the phone can reach the machine off-LAN (§4.2), and a suite that
+//! kept testing the TCP rung would be green about code no user runs.
+//!
+//! # How two endpoints in one process find each other
+//!
+//! A `NodeId` on its own is resolved through iroh's DNS-based address lookup,
+//! which cannot answer for an endpoint that exists only inside this test binary.
+//! So [`Stub`] binds `127.0.0.1:0` with the relay and address publication
+//! switched off, and hands the client its bound socket *alongside* the node id —
+//! which is exactly what a pairing QR pins (§4.6), and the same approach
+//! `gonomad-transport`'s `iroh_p2p.rs` uses. Every test here therefore runs over
+//! a genuine direct QUIC path and needs no network at all.
+//!
+//! One asymmetry is worth naming: the client's own endpoint is built inside
+//! `establish()` with shipping defaults, so it does reach for n0's relays and
+//! address lookup in the background. No outcome asserted here depends on that —
+//! the pinned loopback address is the only path either side can complete — so the
+//! suite passes offline and is not quietly testing the internet.
 //!
 //! The daemon's request router does not exist yet (`gonomad-server` renders the
 //! pairing QR and stops), so [`Stub`] stands in for it. It implements only what
@@ -32,7 +50,7 @@ use gonomad_proto::{
     Response, ResponseBody, PROTOCOL_VERSION,
 };
 use gonomad_transport::{
-    AllowAny, Allowlist, SendStream, ServerConfig, TcpConnection, TcpTransport,
+    AllowAny, Allowlist, IrohConfig, IrohConnection, IrohTransport, RelayPolicy, SendStream,
 };
 use serde::Serialize;
 use tempfile::TempDir;
@@ -62,10 +80,11 @@ enum Behaviour {
     HangUp,
 }
 
-/// A daemon stand-in: a bound listener plus the task serving it.
+/// A daemon stand-in: a bound iroh endpoint plus the task serving it.
 struct Stub {
-    addr: SocketAddr,
-    /// Aborted on drop, which also drops the listener and every connection.
+    /// Shared with the accept task, which needs the endpoint alive to accept on.
+    transport: Arc<IrohTransport>,
+    /// Aborted on drop, which also drops the endpoint and every connection.
     accepting: tokio::task::JoinHandle<()>,
 }
 
@@ -83,7 +102,7 @@ impl Stub {
         behaviour: Behaviour,
     ) -> Self {
         let policy = Arc::new(Allowlist::new(vec![phone]));
-        let config = ServerConfig::reconnect(Arc::clone(daemon), policy);
+        let config = IrohConfig::reconnect(Arc::clone(daemon), policy);
         Self::bind(config, behaviour).await
     }
 
@@ -93,7 +112,7 @@ impl Stub {
         secret: &PairingSecret,
         behaviour: Behaviour,
     ) -> Self {
-        let mut config = ServerConfig::pairing(Arc::clone(daemon), secret);
+        let mut config = IrohConfig::pairing(Arc::clone(daemon), secret);
         // Explicit, so the test states the property R24 depends on: during a
         // pairing window the peer's key is by definition unknown, and the
         // pre-shared key is the only thing authenticating it.
@@ -101,28 +120,63 @@ impl Stub {
         Self::bind(config, behaviour).await
     }
 
-    async fn bind(config: ServerConfig, behaviour: Behaviour) -> Self {
-        let transport = TcpTransport::bind("127.0.0.1:0".parse().expect("literal"), config)
-            .await
-            .expect("bind the stub");
-        let addr = transport.local_addr().expect("bound");
-        let accepting = tokio::spawn(async move {
-            while let Ok(conn) = transport.accept_lan().await {
-                tokio::spawn(serve(conn, behaviour));
+    async fn bind(config: IrohConfig, behaviour: Behaviour) -> Self {
+        let expected = config.identity.iroh_node_id();
+        let transport = IrohTransport::bind(IrohConfig {
+            // Nothing that could reach the internet: the client is handed a
+            // pinned loopback address, so a direct path is the only one either
+            // side can complete and no result here depends on n0's relays.
+            relay: RelayPolicy::Disabled,
+            address_lookup: false,
+            bind_addrs: vec!["127.0.0.1:0".parse().expect("literal")],
+            ..config
+        })
+        .await
+        .expect("bind the stub");
+        // What lets `remember` and `qr` derive the node id from the identity
+        // instead of reading it back off the endpoint: the endpoint's secret key
+        // *is* the identity's iroh subkey, so the two cannot disagree.
+        assert_eq!(
+            transport.node_id(),
+            expected,
+            "the stub is not listening at the node id its ticket advertises"
+        );
+
+        let transport = Arc::new(transport);
+        let accepting = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move {
+                while let Ok(conn) = transport.accept_iroh().await {
+                    tokio::spawn(serve(conn, behaviour));
+                }
             }
         });
-        Self { addr, accepting }
+        Self {
+            transport,
+            accepting,
+        }
     }
 
-    /// The stub's address as a pairing-ticket hint.
-    fn hint(&self) -> String {
-        self.addr.to_string()
+    /// The stub's bound addresses, as pairing-ticket hints.
+    ///
+    /// Dialling by node id alone would need iroh's address lookup, which is off
+    /// here and could not resolve an endpoint that exists only in this process
+    /// anyway. Pinning the socket is what a real pairing QR does for the
+    /// same-network case (§4.6), so this is the shipping path and not a shortcut.
+    fn hints(&self) -> Vec<String> {
+        self.transport
+            .bound_sockets()
+            .iter()
+            .map(SocketAddr::to_string)
+            .collect()
     }
 }
 
 /// Serves one connection: hello, then requests, until the peer goes away.
-async fn serve(conn: TcpConnection, behaviour: Behaviour) {
-    let Ok((mut tx, mut rx)) = conn.accept_bi().await else {
+async fn serve(conn: IrohConnection, behaviour: Behaviour) {
+    // The dialling side opens the control stream, so this is the accepting half
+    // of the stream the connection handshake already authenticated.
+    let Ok((mut tx, mut rx)) = conn.accept_stream().await else {
         return;
     };
     let sas = conn.sas().digits();
@@ -323,14 +377,19 @@ impl Fixture {
     }
 
     /// Records a paired daemon, as `confirm_pairing` would have.
-    fn remember(&self, daemon: &DeviceIdentity, hint: &str) {
+    ///
+    /// The node id is what the client dials with; `hints` are the addresses it
+    /// tries first, and are what makes a loopback endpoint reachable without
+    /// discovery.
+    fn remember(&self, daemon: &DeviceIdentity, hints: &[String]) {
         self.storage
             .save_daemon(&PairedDaemon {
                 noise_key: daemon.noise_public_key(),
+                node_id: Some(daemon.iroh_node_id()),
                 device_id: daemon.noise_public_key().to_hex(),
                 registered_device_id: "a".repeat(64),
                 name: STUB_NAME.to_owned(),
-                addr_hints: vec![hint.to_owned()],
+                addr_hints: hints.to_vec(),
                 paired_at_ms: 1_700_000_000_000,
                 last_seen_ms: None,
             })
@@ -381,12 +440,16 @@ impl Recorder {
 }
 
 /// Builds the QR payload a phone would scan.
-fn qr(daemon: &DeviceIdentity, hint: &str, secret: &PairingSecret) -> String {
+fn qr(daemon: &DeviceIdentity, hints: &[String], secret: &PairingSecret) -> String {
     PairingTicket {
         // The X25519 Noise static key, which is what the ticket actually carries
         // and what the IK initiator must know in advance.
         daemon_key: daemon.noise_public_key(),
-        addr_hints: vec![hint.to_owned()],
+        // Mandatory for an iroh dial — `AddrHint::from_ticket` puts it first and
+        // `connect_iroh` refuses without it — and the only hint that survives
+        // either side changing network.
+        node_id: daemon.iroh_node_id(),
+        addr_hints: hints.to_vec(),
         relay_hint: None,
     }
     .encode(secret)
@@ -397,7 +460,7 @@ async fn connect_then_sys_info_then_list_a_directory() {
     let fixture = Fixture::new();
     let daemon = Arc::new(DeviceIdentity::generate());
     let stub = Stub::reconnect(&daemon, fixture.phone_noise_key, Behaviour::Full).await;
-    fixture.remember(&daemon, &stub.hint());
+    fixture.remember(&daemon, &stub.hints());
 
     let client = fixture.client();
     let recorder = Arc::new(Recorder::default());
@@ -455,7 +518,7 @@ async fn many_requests_are_correlated_to_their_own_responses() {
     let fixture = Fixture::new();
     let daemon = Arc::new(DeviceIdentity::generate());
     let stub = Stub::reconnect(&daemon, fixture.phone_noise_key, Behaviour::Full).await;
-    fixture.remember(&daemon, &stub.hint());
+    fixture.remember(&daemon, &stub.hints());
 
     let client = Arc::new(fixture.client());
     client.connect().await.expect("connect");
@@ -485,7 +548,7 @@ async fn a_request_that_is_never_answered_times_out() {
     let fixture = Fixture::new();
     let daemon = Arc::new(DeviceIdentity::generate());
     let stub = Stub::reconnect(&daemon, fixture.phone_noise_key, Behaviour::Silent).await;
-    fixture.remember(&daemon, &stub.hint());
+    fixture.remember(&daemon, &stub.hints());
 
     let client = fixture.client();
     client.connect().await.expect("the hello still completes");
@@ -513,7 +576,7 @@ async fn an_unknown_method_surfaces_as_unsupported() {
     let fixture = Fixture::new();
     let daemon = Arc::new(DeviceIdentity::generate());
     let stub = Stub::reconnect(&daemon, fixture.phone_noise_key, Behaviour::OnlySysInfo).await;
-    fixture.remember(&daemon, &stub.hint());
+    fixture.remember(&daemon, &stub.hints());
 
     let client = fixture.client();
     client.connect().await.expect("connect");
@@ -541,13 +604,19 @@ async fn pairing_with_the_wrong_secret_persists_nothing() {
 
     // The scanned code carries a different secret: a photographed QR, a replayed
     // code, or a guess.
-    let scanned = qr(&daemon, &stub.hint(), &PairingSecret::generate());
+    let scanned = qr(&daemon, &stub.hints(), &PairingSecret::generate());
 
     let client = fixture.client();
     let outcome = client.begin_pairing(scanned).await;
+    // Specifically `PairingRejected`, not any transport failure. The distinction is
+    // the point: `Transport(_)` would also match "the machine was never reached",
+    // so it would pass even if the stub had not been listening and would prove
+    // nothing about the secret. This asserts the daemon answered and the AEAD check
+    // on its response failed — which is the only outcome that is evidence about the
+    // code (§19 R24).
     assert!(
-        matches!(outcome, Err(ClientError::Transport(_))),
-        "expected the handshake to fail, got {outcome:?}"
+        matches!(outcome, Err(ClientError::PairingRejected)),
+        "expected the handshake to be rejected, got {outcome:?}"
     );
 
     assert!(!client.is_paired());
@@ -581,7 +650,7 @@ async fn pairing_shows_the_sas_first_and_persists_only_after_registering() {
     let client = fixture.client();
 
     let sas = client
-        .begin_pairing(qr(&daemon, &stub.hint(), &secret))
+        .begin_pairing(qr(&daemon, &stub.hints(), &secret))
         .await
         .expect("the handshake completes with the right secret");
     // Six digits, grouped three and three, as the UI shows them.
@@ -610,7 +679,7 @@ async fn pairing_shows_the_sas_first_and_persists_only_after_registering() {
     // daemon assigned this phone is kept beside it, for the audit trail.
     assert_eq!(info.device_id, daemon.noise_public_key().to_hex());
     assert_eq!(info.registered_device_id, "f".repeat(64));
-    assert_eq!(info.addr_hints, vec![stub.hint()]);
+    assert_eq!(info.addr_hints, stub.hints());
     assert_eq!(info.noise_key, daemon.noise_public_key());
     assert_eq!(client.status().phase, ConnPhase::Disconnected);
 }
@@ -626,7 +695,7 @@ async fn a_machine_that_refuses_to_register_leaves_nothing_stored() {
     let client = fixture.client();
 
     client
-        .begin_pairing(qr(&daemon, &stub.hint(), &secret))
+        .begin_pairing(qr(&daemon, &stub.hints(), &secret))
         .await
         .expect("the handshake completes");
 
@@ -644,7 +713,7 @@ async fn a_spawned_terminal_pushes_frames_until_it_is_closed() {
     let fixture = Fixture::new();
     let daemon = Arc::new(DeviceIdentity::generate());
     let stub = Stub::reconnect(&daemon, fixture.phone_noise_key, Behaviour::Full).await;
-    fixture.remember(&daemon, &stub.hint());
+    fixture.remember(&daemon, &stub.hints());
 
     let screens = Arc::new(Screens::default());
 
@@ -686,7 +755,7 @@ async fn disconnecting_reports_it_and_leaves_the_pairing_intact() {
     let fixture = Fixture::new();
     let daemon = Arc::new(DeviceIdentity::generate());
     let stub = Stub::reconnect(&daemon, fixture.phone_noise_key, Behaviour::Full).await;
-    fixture.remember(&daemon, &stub.hint());
+    fixture.remember(&daemon, &stub.hints());
 
     let client = fixture.client();
     client.connect().await.expect("connect");
@@ -713,7 +782,7 @@ async fn a_machine_that_hangs_up_is_noticed_and_the_state_corrected() {
     let fixture = Fixture::new();
     let daemon = Arc::new(DeviceIdentity::generate());
     let stub = Stub::reconnect(&daemon, fixture.phone_noise_key, Behaviour::HangUp).await;
-    fixture.remember(&daemon, &stub.hint());
+    fixture.remember(&daemon, &stub.hints());
 
     let client = fixture.client();
     client
@@ -743,7 +812,7 @@ async fn unpairing_wipes_the_key_so_the_old_registration_cannot_be_reused() {
     let fixture = Fixture::new();
     let daemon = Arc::new(DeviceIdentity::generate());
     let stub = Stub::reconnect(&daemon, fixture.phone_noise_key, Behaviour::Full).await;
-    fixture.remember(&daemon, &stub.hint());
+    fixture.remember(&daemon, &stub.hints());
 
     let client = fixture.client();
     client.connect().await.expect("connect");
@@ -765,12 +834,49 @@ async fn unpairing_wipes_the_key_so_the_old_registration_cannot_be_reused() {
 }
 
 #[tokio::test]
+async fn pairing_with_an_unreachable_machine_does_not_blame_the_pairing_code() {
+    // The regression this exists for was a real one. A phone that had simply moved
+    // to mobile data was told "that code didn't match", because every failure
+    // during pairing — unreachable machine included — was reported as a bad code.
+    // The user went looking for a typo and a firewall rule; neither was the
+    // problem.
+    //
+    // The pairing here is perfectly valid. Nothing is listening at the node id, so
+    // the only correct answer is a transport failure. `PairingRejected` is reserved
+    // for a machine that answered and turned the code down, and asserting the
+    // absence of it is the whole point of the test.
+    let fixture = Fixture::new();
+    let daemon = Arc::new(DeviceIdentity::generate());
+    let secret = PairingSecret::generate();
+    // No `Stub`: the ticket names a node id that never bound an endpoint.
+    let scanned = qr(&daemon, &["127.0.0.1:1".to_owned()], &secret);
+
+    let client = fixture.client();
+    let outcome = client.begin_pairing(scanned).await;
+    assert!(
+        matches!(outcome, Err(ClientError::Transport(_))),
+        "an unreachable machine must read as a transport failure, got {outcome:?}"
+    );
+    assert!(
+        !matches!(outcome, Err(ClientError::PairingRejected)),
+        "an unreachable machine must never be reported as a wrong pairing code"
+    );
+
+    // And it still persisted nothing, so the R24 property does not depend on which
+    // of the two failures occurred.
+    assert!(!client.is_paired());
+    assert_eq!(fixture.storage.load_daemon().expect("load"), None);
+}
+
+#[tokio::test]
 async fn a_daemon_that_is_not_listening_reports_a_transport_failure() {
     let fixture = Fixture::new();
     let daemon = Arc::new(DeviceIdentity::generate());
-    // A hint that points at nothing: what a stale address looks like after the
-    // laptop changed network.
-    fixture.remember(&daemon, "127.0.0.1:1");
+    // A node id nothing is bound to, and a hint that points at nothing: what a
+    // stale record looks like once the machine has gone. Takes the client's full
+    // connect timeout to fail, because iroh keeps trying — that patience is the
+    // point on a rung where hole punching legitimately takes seconds.
+    fixture.remember(&daemon, &["127.0.0.1:1".to_owned()]);
 
     let client = fixture.client();
     let outcome = client.connect().await;

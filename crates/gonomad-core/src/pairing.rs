@@ -146,54 +146,130 @@ impl Drop for PairingSecret {
 /// Rendered as a QR code on the laptop. Address hints are included so the first
 /// connection needs no discovery round trip at all (§4.6) — but they are hints
 /// only, and a stale hint costs a fallback, never a failure.
+///
+/// # Two keys, and why both are mandatory
+///
+/// [`PairingTicket::daemon_key`] is the X25519 Noise static: it authenticates
+/// the *session* (§3.4), on every transport. [`PairingTicket::node_id`] is the
+/// iroh `NodeId`: it is the *address* off-LAN, because iroh dials public keys
+/// rather than IP addresses (§4.3). Neither substitutes for the other, and a
+/// ticket carrying only the first is a ticket that works on the sofa and fails
+/// on mobile data — which is why the field is required rather than optional.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingTicket {
-    /// The daemon's Ed25519 public key. Learning this over the optical channel
-    /// is what makes a network man-in-the-middle impossible.
+    /// The daemon's X25519 Noise static key. Learning this over the optical
+    /// channel is what makes a network man-in-the-middle impossible.
     pub daemon_key: PublicKey,
+    /// The daemon's iroh `NodeId` — `DeviceIdentity::iroh_node_id`.
+    ///
+    /// An Ed25519 public key, and **not** the same key as
+    /// [`PairingTicket::daemon_key`]. Without it the phone cannot dial at all
+    /// once the two devices are on different networks: there is no address to
+    /// fall back to, because in iroh the key *is* the address.
+    pub node_id: PublicKey,
     /// Direct socket addresses to try first, e.g. `192.168.1.4:41234`.
+    ///
+    /// Retained even though iroh discovers addresses on its own: a hint that is
+    /// still valid makes the LAN path succeed on the first packet, with no
+    /// discovery round trip and no relay.
     pub addr_hints: Vec<String>,
     /// The daemon's home relay URL, for the CGNAT case.
     pub relay_hint: Option<String>,
 }
 
 /// Ticket format version, so a future layout change is detectable.
-const TICKET_VERSION: u8 = 1;
+///
+/// Bumped to 2 when the iroh `NodeId` was added. A version 1 ticket is not
+/// parsed as a truncated version 2 one: the version byte is checked before any
+/// field is read, so an old ticket fails with
+/// [`PairingError::UnsupportedVersion`] and the phone can say "update your
+/// daemon" rather than "invalid code".
+const TICKET_VERSION: u8 = 2;
 
-/// Fixed-size portion of a ticket body: version, key, secret, hint length.
-const TICKET_FIXED_LEN: usize = 1 + 32 + PAIRING_SECRET_LEN + 2;
+/// Fixed-size portion of a ticket body: version, both keys, secret, hint length.
+const TICKET_FIXED_LEN: usize = 1 + 32 + 32 + PAIRING_SECRET_LEN + 2;
+
+/// Byte offsets of the fixed fields, so the parser never counts by hand.
+const NODE_ID_AT: usize = 1 + 32;
+const SECRET_AT: usize = NODE_ID_AT + 32;
+
+/// A hint's type tag. Every hint is `kind ‖ len ‖ payload`, so a kind this build
+/// does not know is *skipped* rather than fatal.
+const HINT_IPV4: u8 = 1;
+/// An IPv6 socket address: 16 address bytes then a big-endian port.
+const HINT_IPV6: u8 = 2;
+/// A direct address that is not a canonical socket address, kept as UTF-8.
+const HINT_TEXT: u8 = 3;
+/// A relay URL, as UTF-8.
+const HINT_RELAY: u8 = 4;
+
+/// Bytes of hint header: the kind tag plus the one-byte length.
+const HINT_HEADER_LEN: usize = 2;
 
 impl PairingTicket {
     /// Encodes the ticket and secret into the string placed in the QR code.
     ///
-    /// Layout: `gonomad1:` + Crockford-base32( version ‖ key ‖ secret ‖ hints ).
-    /// Base32 rather than base64 because QR codes have a dedicated alphanumeric
-    /// mode that covers uppercase base32 and stores it far more densely than
-    /// mixed-case binary-safe encodings.
+    /// Layout: `gonomad1:` + Crockford-base32( version ‖ noise key ‖ node id ‖
+    /// secret ‖ u16 hint length ‖ hints ). Base32 rather than base64 because QR
+    /// codes have a dedicated alphanumeric mode that covers uppercase base32 and
+    /// stores it far more densely than mixed-case binary-safe encodings.
+    ///
+    /// # Why the hints are binary rather than text
+    ///
+    /// Every byte here is a denser QR code and a harder scan, and the ticket had
+    /// to grow by a 32-byte public key that nothing can shrink. The address hints
+    /// pay some of that back: `192.168.1.4:41234` is 17 characters as text and
+    /// 6 bytes as an address plus a port. A socket address that does not
+    /// round-trip through its own `Display` — anything unusual — falls back to a
+    /// verbatim text record, so fidelity never depends on formatting rules
+    /// agreeing across versions.
     #[must_use]
     pub fn encode(&self, secret: &PairingSecret) -> String {
-        let mut body = Vec::with_capacity(96);
+        let mut body = Vec::with_capacity(TICKET_FIXED_LEN + 64);
         body.push(TICKET_VERSION);
         body.extend_from_slice(self.daemon_key.as_bytes());
+        body.extend_from_slice(self.node_id.as_bytes());
         body.extend_from_slice(secret.as_bytes());
 
-        // Hints are length-prefixed UTF-8. A single joined string with a
-        // separator would break on any address containing that separator.
-        let joined = self.hint_blob();
-        let len = u16::try_from(joined.len()).unwrap_or(u16::MAX);
+        let hints = self.encode_hints();
+        // A hint blob that cannot be described by the u16 length is dropped
+        // wholesale rather than truncated: half a hint list is worse than none,
+        // because a truncated final hint would decode as a different address.
+        let len = u16::try_from(hints.len()).unwrap_or(0);
         body.extend_from_slice(&len.to_be_bytes());
-        body.extend_from_slice(&joined.as_bytes()[..len as usize]);
+        body.extend_from_slice(&hints[..usize::from(len)]);
 
         format!("{TICKET_PREFIX}{}", crockford().encode(&body))
     }
 
-    /// Serialises the address and relay hints into one newline-separated blob.
-    fn hint_blob(&self) -> String {
-        let mut parts: Vec<String> = self.addr_hints.iter().map(|a| format!("a{a}")).collect();
-        if let Some(relay) = &self.relay_hint {
-            parts.push(format!("r{relay}"));
+    /// Serialises the address and relay hints as length-tagged records.
+    fn encode_hints(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for hint in &self.addr_hints {
+            match hint.parse::<std::net::SocketAddr>() {
+                // Only take the compact form when the address renders back to
+                // exactly what was given. Otherwise `[::0001]:80` would decode
+                // as `[::1]:80`, and a round trip that silently rewrites its
+                // input is a bug waiting for a hint that matters.
+                Ok(std::net::SocketAddr::V4(v4)) if v4.to_string() == *hint => {
+                    let mut payload = Vec::with_capacity(6);
+                    payload.extend_from_slice(&v4.ip().octets());
+                    payload.extend_from_slice(&v4.port().to_be_bytes());
+                    push_hint(&mut out, HINT_IPV4, &payload);
+                }
+                Ok(std::net::SocketAddr::V6(v6)) if v6.to_string() == *hint => {
+                    let mut payload = Vec::with_capacity(18);
+                    payload.extend_from_slice(&v6.ip().octets());
+                    payload.extend_from_slice(&v6.port().to_be_bytes());
+                    push_hint(&mut out, HINT_IPV6, &payload);
+                }
+                _ => push_hint(&mut out, HINT_TEXT, hint.as_bytes()),
+            }
         }
-        parts.join("\n")
+        if let Some(relay) = &self.relay_hint {
+            push_hint(&mut out, HINT_RELAY, relay.as_bytes());
+        }
+        out
     }
 
     /// Decodes a scanned QR payload.
@@ -214,56 +290,134 @@ impl PairingTicket {
             .decode(encoded.as_bytes())
             .map_err(|_| PairingError::NotBase32)?;
 
+        // The version is checked before the length, not after. A version 1
+        // ticket is *shorter* than this layout's fixed portion, so a
+        // length-first parser would report it as malformed — and "invalid code"
+        // sends the user to look for a typo in a QR they cannot read, when the
+        // real answer is "update your daemon". The version byte is the first byte
+        // on the wire precisely so it can be trusted before anything else.
+        let Some(&version) = body.first() else {
+            return Err(PairingError::BadLength);
+        };
+        if version != TICKET_VERSION {
+            return Err(PairingError::UnsupportedVersion { version });
+        }
         if body.len() < TICKET_FIXED_LEN {
             return Err(PairingError::BadLength);
         }
 
-        let version = body[0];
-        if version != TICKET_VERSION {
-            return Err(PairingError::UnsupportedVersion { version });
-        }
-
         let mut key = [0u8; 32];
-        key.copy_from_slice(&body[1..33]);
+        key.copy_from_slice(&body[1..NODE_ID_AT]);
+
+        let mut node_id = [0u8; 32];
+        node_id.copy_from_slice(&body[NODE_ID_AT..SECRET_AT]);
 
         let mut secret = [0u8; PAIRING_SECRET_LEN];
-        secret.copy_from_slice(&body[33..33 + PAIRING_SECRET_LEN]);
+        secret.copy_from_slice(&body[SECRET_AT..SECRET_AT + PAIRING_SECRET_LEN]);
 
         let hint_len =
             u16::from_be_bytes([body[TICKET_FIXED_LEN - 2], body[TICKET_FIXED_LEN - 1]]) as usize;
         if body.len() != TICKET_FIXED_LEN + hint_len {
             return Err(PairingError::BadLength);
         }
-        let hint_str = core::str::from_utf8(&body[TICKET_FIXED_LEN..TICKET_FIXED_LEN + hint_len])
-            .map_err(|_| PairingError::BadLength)?;
-
-        let mut addr_hints = Vec::new();
-        let mut relay_hint = None;
-        for part in hint_str.split('\n').filter(|s| !s.is_empty()) {
-            match part.as_bytes()[0] {
-                b'a' => addr_hints.push(part[1..].to_owned()),
-                b'r' => relay_hint = Some(part[1..].to_owned()),
-                // Unknown hint kinds are skipped rather than rejected: a newer
-                // daemon adding a hint type must not break an older phone,
-                // since hints are advisory and the connection can still succeed.
-                _ => {}
-            }
-        }
+        let (addr_hints, relay_hint) = decode_hints(&body[TICKET_FIXED_LEN..])?;
 
         let secret = PairingSecret::from_bytes(secret);
-        // Wipe the stack copy now that ownership has moved into the zeroizing type.
+        // Wipe the stack copies now that ownership has moved on. Neither is
+        // secret, but the buffers are adjacent to one that is and a uniform
+        // habit is cheaper than a case-by-case judgement.
         let mut scratch = key;
         scratch.zeroize();
 
         Ok((
             Self {
                 daemon_key: PublicKey::from_bytes(key),
+                node_id: PublicKey::from_bytes(node_id),
                 addr_hints,
                 relay_hint,
             },
             secret,
         ))
     }
+}
+
+/// Appends one `kind ‖ len ‖ payload` record, dropping anything too long to
+/// describe.
+///
+/// A hint longer than 255 bytes is skipped rather than truncated: hints are
+/// advisory, so losing one costs a fallback, while a truncated relay URL would
+/// send the phone somewhere else entirely.
+fn push_hint(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
+    let Ok(len) = u8::try_from(payload.len()) else {
+        return;
+    };
+    out.reserve(HINT_HEADER_LEN + payload.len());
+    out.push(kind);
+    out.push(len);
+    out.extend_from_slice(payload);
+}
+
+/// Parses the hint records, returning the direct addresses in order and the
+/// relay.
+///
+/// Runs on bytes from a scanned QR code, so every read is bounds-checked and
+/// nothing here can panic.
+fn decode_hints(mut rest: &[u8]) -> Result<(Vec<String>, Option<String>), PairingError> {
+    let mut addr_hints = Vec::new();
+    let mut relay_hint = None;
+
+    while !rest.is_empty() {
+        if rest.len() < HINT_HEADER_LEN {
+            return Err(PairingError::BadLength);
+        }
+        let kind = rest[0];
+        let len = usize::from(rest[1]);
+        let end = HINT_HEADER_LEN + len;
+        // A record claiming more bytes than remain means the blob is corrupt.
+        // Rejected rather than salvaged: the alternative is deciding what a
+        // half-parsed address list means, and there is no good answer.
+        if rest.len() < end {
+            return Err(PairingError::BadLength);
+        }
+        let payload = &rest[HINT_HEADER_LEN..end];
+
+        match kind {
+            HINT_IPV4 => {
+                if let Ok(raw) = <[u8; 6]>::try_from(payload) {
+                    let ip = std::net::Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]);
+                    let port = u16::from_be_bytes([raw[4], raw[5]]);
+                    addr_hints.push(std::net::SocketAddrV4::new(ip, port).to_string());
+                }
+            }
+            HINT_IPV6 => {
+                if let Ok(raw) = <[u8; 18]>::try_from(payload) {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&raw[..16]);
+                    let ip = std::net::Ipv6Addr::from(octets);
+                    let port = u16::from_be_bytes([raw[16], raw[17]]);
+                    addr_hints.push(std::net::SocketAddrV6::new(ip, port, 0, 0).to_string());
+                }
+            }
+            HINT_TEXT => {
+                if let Ok(text) = core::str::from_utf8(payload) {
+                    addr_hints.push(text.to_owned());
+                }
+            }
+            HINT_RELAY => {
+                if let Ok(text) = core::str::from_utf8(payload) {
+                    relay_hint = Some(text.to_owned());
+                }
+            }
+            // Unknown kinds are skipped rather than rejected: a newer daemon
+            // adding a hint type must not break an older phone, since hints are
+            // advisory and the connection can still succeed without them. The
+            // length byte is what makes skipping possible at all.
+            _ => {}
+        }
+        rest = &rest[end..];
+    }
+
+    Ok((addr_hints, relay_hint))
 }
 
 /// The typed fallback when a camera is unavailable, e.g. `K7M2-9QRX`.
@@ -423,6 +577,7 @@ mod tests {
     fn ticket() -> PairingTicket {
         PairingTicket {
             daemon_key: PublicKey::from_bytes([0xAB; 32]),
+            node_id: PublicKey::from_bytes([0xCD; 32]),
             addr_hints: vec!["192.168.1.4:41234".into(), "[2001:db8::1]:41234".into()],
             relay_hint: Some("https://relay.example.com".into()),
         }
@@ -445,12 +600,81 @@ mod tests {
     fn ticket_without_hints_round_trips() {
         let t = PairingTicket {
             daemon_key: PublicKey::from_bytes([1u8; 32]),
+            node_id: PublicKey::from_bytes([2u8; 32]),
             addr_hints: vec![],
             relay_hint: None,
         };
         let secret = PairingSecret::generate();
         let (decoded, _) = PairingTicket::decode(&t.encode(&secret)).unwrap();
         assert_eq!(decoded, t);
+    }
+
+    #[test]
+    fn the_two_keys_do_not_get_swapped_in_transit() {
+        // They are both 32 bytes at adjacent offsets, so a transposed pair would
+        // decode cleanly and then fail every handshake with no clue why.
+        let t = ticket();
+        let (decoded, _) = PairingTicket::decode(&t.encode(&PairingSecret::generate())).unwrap();
+        assert_eq!(decoded.daemon_key, PublicKey::from_bytes([0xAB; 32]));
+        assert_eq!(decoded.node_id, PublicKey::from_bytes([0xCD; 32]));
+    }
+
+    #[test]
+    fn the_node_id_costs_a_bounded_number_of_qr_characters() {
+        // The QR is scanned by a phone camera, so payload length is a product
+        // constraint, not a detail. This pins the budget: a representative
+        // ticket — two address hints and a relay URL — must stay inside a payload
+        // that QR version 11 encodes comfortably in alphanumeric mode at
+        // error-correction level M (468 characters).
+        let payload = ticket().encode(&PairingSecret::generate());
+        assert!(
+            payload.len() <= 260,
+            "ticket payload grew to {} characters",
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn address_hints_are_stored_compactly() {
+        // The binary hint encoding is what pays for the node id. An IPv4 hint
+        // costs 8 bytes of body (kind, length, four octets, port) rather than
+        // the 18 the old text form needed.
+        let mut with_hint = ticket();
+        with_hint.addr_hints = vec!["192.168.1.4:41234".into()];
+        with_hint.relay_hint = None;
+        let mut bare = with_hint.clone();
+        bare.addr_hints = vec![];
+
+        let secret = PairingSecret::generate();
+        let grown = with_hint.encode(&secret).len() - bare.encode(&secret).len();
+        // 8 bytes of body is at most 13 base32 characters once alignment is
+        // accounted for; text encoding could not be under 29.
+        assert!(grown <= 14, "an IPv4 hint cost {grown} characters");
+    }
+
+    #[test]
+    fn an_unusual_address_hint_survives_verbatim() {
+        // A hint that is not a canonical socket address must not be rewritten or
+        // dropped: a daemon may one day emit a hostname, and a silently mangled
+        // hint is worse than a missing one.
+        let mut t = ticket();
+        t.addr_hints = vec![
+            "laptop.local:41234".into(),
+            "[::0001]:80".into(),
+            String::new(),
+        ];
+        let (decoded, _) = PairingTicket::decode(&t.encode(&PairingSecret::generate())).unwrap();
+        assert_eq!(decoded.addr_hints, t.addr_hints);
+    }
+
+    #[test]
+    fn a_hint_too_long_to_describe_is_dropped_not_truncated() {
+        // A truncated relay URL would point the phone at a different host.
+        let mut t = ticket();
+        t.relay_hint = Some("h".repeat(300));
+        let (decoded, _) = PairingTicket::decode(&t.encode(&PairingSecret::generate())).unwrap();
+        assert_eq!(decoded.relay_hint, None);
+        assert_eq!(decoded.addr_hints, t.addr_hints);
     }
 
     #[test]
@@ -500,10 +724,26 @@ mod tests {
         // base32 before any length check on the decoded body.
         assert_eq!(decode_err("gonomad1:AAAA"), PairingError::NotBase32);
 
-        // Valid base32 that decodes to too few bytes to be a ticket. Eight
-        // symbols is exactly 5 bytes, far short of TICKET_FIXED_LEN.
+        // An empty body has no version byte to report on.
         assert_eq!(decode_err("gonomad1:"), PairingError::BadLength);
-        assert_eq!(decode_err("gonomad1:AAAAAAAA"), PairingError::BadLength);
+
+        // Valid base32 that decodes to five bytes (Crockford `A` is 10, so the
+        // first byte is 0x52). The version byte is checked first, so this is
+        // reported as an unsupported version rather than a length problem — see
+        // `decode` for why that ordering matters.
+        assert_eq!(
+            decode_err("gonomad1:AAAAAAAA"),
+            PairingError::UnsupportedVersion { version: 0x52 }
+        );
+
+        // A body that starts with the right version but stops short is a length
+        // problem, and that is what a truncated scan looks like.
+        let good = ticket().encode(&PairingSecret::generate());
+        let short = &good.strip_prefix(TICKET_PREFIX).unwrap()[..8];
+        assert_eq!(
+            decode_err(&format!("{TICKET_PREFIX}{short}")),
+            PairingError::BadLength
+        );
     }
 
     #[test]
@@ -511,12 +751,33 @@ mod tests {
         // So the phone can say "update your app" rather than "invalid code".
         let mut body = vec![99u8];
         body.extend_from_slice(&[0u8; 32]);
+        body.extend_from_slice(&[0u8; 32]);
         body.extend_from_slice(&[0u8; PAIRING_SECRET_LEN]);
         body.extend_from_slice(&0u16.to_be_bytes());
         let payload = format!("{TICKET_PREFIX}{}", crockford().encode(&body));
         assert_eq!(
             decode_err(&payload),
             PairingError::UnsupportedVersion { version: 99 }
+        );
+    }
+
+    #[test]
+    fn a_version_one_ticket_is_rejected_rather_than_misparsed() {
+        // The layout that shipped before the node id: version, one key, secret,
+        // and newline-separated text hints. It is a *prefix* of nothing valid, so
+        // the danger is not that it fails — it is that it could decode into a
+        // ticket whose node id was really the first half of the pairing secret.
+        let mut body = vec![1u8];
+        body.extend_from_slice(&[0xAB; 32]);
+        body.extend_from_slice(&[0x5A; PAIRING_SECRET_LEN]);
+        let hints = "a192.168.1.4:41234";
+        body.extend_from_slice(&u16::try_from(hints.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(hints.as_bytes());
+
+        let payload = format!("{TICKET_PREFIX}{}", crockford().encode(&body));
+        assert_eq!(
+            decode_err(&payload),
+            PairingError::UnsupportedVersion { version: 1 }
         );
     }
 
@@ -533,20 +794,54 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unknown_hint_kinds_are_skipped_for_forward_compatibility() {
-        // A newer daemon adding a hint type must not break an older phone.
+    /// Assembles a ticket body with a hand-written hint blob.
+    fn body_with_hints(hints: &[u8]) -> String {
         let mut body = vec![TICKET_VERSION];
         body.extend_from_slice(&[7u8; 32]);
+        body.extend_from_slice(&[9u8; 32]);
         body.extend_from_slice(&[8u8; PAIRING_SECRET_LEN]);
-        let hints = "a1.2.3.4:1\nzsomething-new\nrhttps://r";
         body.extend_from_slice(&u16::try_from(hints.len()).unwrap().to_be_bytes());
-        body.extend_from_slice(hints.as_bytes());
+        body.extend_from_slice(hints);
+        format!("{TICKET_PREFIX}{}", crockford().encode(&body))
+    }
 
-        let payload = format!("{TICKET_PREFIX}{}", crockford().encode(&body));
-        let (t, _) = PairingTicket::decode(&payload).unwrap();
+    #[test]
+    fn unknown_hint_kinds_are_skipped_for_forward_compatibility() {
+        // A newer daemon adding a hint type must not break an older phone. The
+        // length byte on every record is what makes skipping possible.
+        let mut hints = vec![HINT_IPV4, 6, 1, 2, 3, 4, 0, 1];
+        hints.extend_from_slice(&[200, 3, b'n', b'e', b'w']);
+        hints.extend_from_slice(&[HINT_RELAY, 9]);
+        hints.extend_from_slice(b"https://r");
+
+        let (t, _) = PairingTicket::decode(&body_with_hints(&hints)).unwrap();
         assert_eq!(t.addr_hints, vec!["1.2.3.4:1"]);
         assert_eq!(t.relay_hint.as_deref(), Some("https://r"));
+    }
+
+    #[test]
+    fn a_hint_record_running_past_the_blob_is_rejected() {
+        // Corrupt rather than forward-compatible: there is no honest reading of a
+        // record that claims more bytes than exist.
+        assert_eq!(
+            decode_err(&body_with_hints(&[HINT_RELAY, 40, b'x'])),
+            PairingError::BadLength
+        );
+        assert_eq!(
+            decode_err(&body_with_hints(&[HINT_IPV4])),
+            PairingError::BadLength
+        );
+    }
+
+    #[test]
+    fn an_address_record_of_the_wrong_size_is_skipped_not_fatal() {
+        // A five-byte "IPv4" address is nonsense, but it is describable, so the
+        // record is skipped and the rest of the list still parses.
+        let mut hints = vec![HINT_IPV4, 5, 1, 2, 3, 4, 0];
+        hints.extend_from_slice(&[HINT_RELAY, 1, b'r']);
+        let (t, _) = PairingTicket::decode(&body_with_hints(&hints)).unwrap();
+        assert!(t.addr_hints.is_empty());
+        assert_eq!(t.relay_hint.as_deref(), Some("r"));
     }
 
     #[test]
@@ -719,19 +1014,21 @@ mod tests {
         #[test]
         fn any_ticket_round_trips(
             key: [u8; 32],
+            node: [u8; 32],
             secret_bytes: [u8; PAIRING_SECRET_LEN],
             addrs: Vec<String>,
         ) {
-            // Hints go through a newline-separated blob, so exclude newlines and
-            // the empty string, which are not valid socket addresses anyway.
+            // Each hint carries a `u8` length, so anything over 255 bytes is
+            // deliberately dropped rather than round-tripped.
             let addrs: Vec<String> = addrs
                 .into_iter()
-                .filter(|a| !a.contains('\n') && !a.is_empty())
+                .filter(|a| a.len() <= 255)
                 .take(4)
                 .collect();
 
             let t = PairingTicket {
                 daemon_key: PublicKey::from_bytes(key),
+                node_id: PublicKey::from_bytes(node),
                 addr_hints: addrs,
                 relay_hint: None,
             };
@@ -758,6 +1055,19 @@ mod tests {
         #[test]
         fn parsing_arbitrary_manual_codes_never_panics(input: String) {
             let _ = ManualCode::parse(&input);
+        }
+
+        /// The hint parser runs on bytes taken straight from a camera. It must
+        /// bounds-check every read rather than trusting a length byte.
+        #[test]
+        fn decoding_arbitrary_hint_records_never_panics(blob: Vec<u8>) {
+            let _ = decode_hints(&blob);
+        }
+
+        #[test]
+        fn a_well_formed_ticket_with_arbitrary_hint_bytes_never_panics(blob: Vec<u8>) {
+            proptest::prop_assume!(u16::try_from(blob.len()).is_ok());
+            let _ = PairingTicket::decode(&body_with_hints(&blob));
         }
 
         #[test]

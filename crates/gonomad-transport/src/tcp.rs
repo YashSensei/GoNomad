@@ -5,63 +5,25 @@
 //! `ARCHITECTURE.md` §4.2 lists LAN direct as Tier 0 and iroh's QUIC as the
 //! default for Tiers 1 and 2. This module is the first rung only: it gets a
 //! phone and a daemon on the same Wi-Fi talking, authenticated and encrypted,
-//! with no NAT traversal problem to solve. Everything is behind the §4.5 traits
-//! so iroh replaces it rather than being bolted beside it.
+//! with no NAT traversal problem to solve. It is **kept** now that
+//! [`crate::iroh`] has landed, because on a LAN it is genuinely faster — one
+//! `connect`, no hole punching, no discovery, no relay to rule out — and because
+//! a second, simpler binding is what keeps the §4.5 abstraction honest.
 //!
-//! The security properties do **not** change when iroh lands, and that is the
+//! The security properties do **not** differ between the two, and that is the
 //! whole reason §3.4 puts Noise inside the transport rather than relying on the
-//! transport's own encryption. This module runs the same `Noise_IK_25519_…`
-//! handshake, from the same `gonomad-core` code, that the QUIC binding will. A
-//! reviewer auditing the session layer audits it once.
+//! transport's own encryption. Both bindings run the same
+//! `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake, from the same code in
+//! [`crate::handshake`], over the same `gonomad-core` session layer. A reviewer
+//! auditing the handshake audits it once.
 //!
-//! # Handshake framing, and why it is not [`gonomad_proto::Frame`]
+//! # Where the interesting parts are documented
 //!
-//! ```text
-//! → u16 len | Noise message 1   (initiator: e, es, s, ss [, psk])
-//! ← u16 len | Noise message 2   (responder: e, ee, se [, psk])
-//! ```
-//!
-//! A `u16` prefix, not a `Frame`, for three reasons:
-//!
-//! 1. **The bound is structural.** A Noise message cannot exceed 65535 bytes by
-//!    specification, so a `u16` makes an over-long claim unrepresentable rather
-//!    than something to validate. `Frame`'s `u32` would have to be bounds-checked
-//!    against a limit chosen by us, on the pre-authentication path, which is
-//!    exactly where the fewest moving parts are worth the most (§3.7).
-//! 2. **No attacker-controlled fields before authentication.** `Frame` carries a
-//!    flags byte with rejection rules. Parsing it before anything is
-//!    authenticated adds surface for no benefit — a handshake message has no
-//!    flags, is never compressed, and is never CBOR.
-//! 3. **Nothing identifies the protocol.** There is no magic number, no version
-//!    byte, and no ALPN-equivalent in the clear. A port scanner sees an
-//!    accepting socket that emits a length-prefixed blob of high-entropy bytes
-//!    and closes. That is the §3.7 "presents nothing to a scanner" property.
-//!
-//! There is no purpose byte announcing pairing versus reconnect either. The
-//! responder already knows: pairing is an explicit, operator-initiated,
-//! 120-second window (§9.1), so the daemon is configured for
-//! [`Purpose::Pairing`] only while that window is open. Letting the *client*
-//! choose which pattern to run would let an attacker ask for the pairing
-//! pattern whenever it liked.
-//!
-//! # A wrong pairing secret is detected by the phone, not by the daemon
-//!
-//! Worth stating because it looks like a hole and is not one. In `IKpsk2` the
-//! pre-shared key is mixed into the **second** message — the one the responder
-//! writes — so the responder cannot tell a wrong PSK from a right one. It
-//! completes its side and produces a session; the initiator's AEAD check then
-//! fails and it aborts.
-//!
-//! The consequence is that a daemon in a pairing window can be made to hold a
-//! short-lived, useless session by anyone who can reach the port: useless
-//! because the two sides derived different keys, so the very first record fails
-//! to decrypt and the connection is torn down with
-//! [`TransportError::Crypto`]. What must **not** happen is a device being
-//! registered on the strength of a completed handshake alone. Registration is
-//! the caller's job and must wait for an authenticated application exchange over
-//! the control stream — which is impossible to fake, precisely because the keys
-//! disagree. The three-attempt cap and the 120-second window
-//! (`gonomad_core::PairingWindow`) bound the attempt rate.
+//! - The handshake, its `u16` framing, why it is not a [`gonomad_proto::Frame`],
+//!   and why a wrong pairing PSK surfaces on the phone rather than the daemon:
+//!   [`crate::handshake`].
+//! - The channel multiplexer this binding needs and QUIC does not, and the
+//!   head-of-line blocking it cannot fix: [`crate::mux`].
 //!
 //! # After the handshake, nothing is plaintext
 //!
@@ -71,18 +33,18 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use gonomad_core::session::NOISE_MAX_MESSAGE_LEN;
-use gonomad_core::{DeviceIdentity, Handshake, PairingSecret, Purpose, Sas, Session};
+use gonomad_core::{DeviceIdentity, PairingSecret, Purpose, Sas, Session};
 use gonomad_proto::PublicKey;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Semaphore};
 use zeroize::Zeroizing;
 
 use crate::error::{from_session, Result, TransportError};
-use crate::mux::{Mux, MuxConfig, RecvStream, Role, SendStream, TaskGuard};
+use crate::handshake::{self, Authenticated};
+use crate::mux::{Mux, MuxConfig, Role, TaskGuard};
+use crate::stream::{RecvStream, SendStream};
 use crate::traits::{AddrHint, AllowAny, BoxFuture, Conn, PathInfo, PeerId, PeerPolicy, Transport};
 
 /// The daemon's default listening port.
@@ -624,41 +586,16 @@ async fn greet(
 
     // Cloned rather than copied out, so the key stays inside a wiping buffer.
     let psk = config.psk.clone();
-    let mut handshake = Handshake::responder(&config.identity, config.purpose, psk.as_deref())
-        .map_err(from_session)?;
-
-    let mut buf = vec![0u8; NOISE_MAX_MESSAGE_LEN];
-    let mut scratch = vec![0u8; NOISE_MAX_MESSAGE_LEN];
-
-    let len = read_handshake(&mut stream, &mut buf).await?;
-    handshake
-        .read_message(&buf[..len], &mut scratch)
-        .map_err(|_| TransportError::HandshakeFailed)?;
-
-    // The peer's key is known now, before a single application byte has been
-    // read. An unpaired device is dropped here, without a reply, so it learns
-    // nothing beyond "the socket closed" (§3.7).
-    let peer = handshake
-        .remote_static()
-        .ok_or(TransportError::HandshakeFailed)?;
-    if !config.policy.authorize(&peer) {
-        return Err(TransportError::PeerNotAuthorized);
-    }
-
-    let len = handshake
-        .write_message(&[], &mut buf)
-        .map_err(|_| TransportError::HandshakeFailed)?;
-    write_handshake(&mut stream, &buf[..len]).await?;
-
-    finish(
-        stream,
-        addr,
-        handshake,
-        peer,
-        Role::Responder,
-        config.mux,
-        None,
+    let authenticated = handshake::respond(
+        &mut stream,
+        &config.identity,
+        config.purpose,
+        psk.as_deref(),
+        config.policy.as_ref(),
     )
+    .await?;
+
+    finish(stream, addr, authenticated, Role::Responder, config.mux)
 }
 
 /// Runs the initiator side of the handshake against one address.
@@ -671,68 +608,20 @@ async fn dial(addr: SocketAddr, peer: PeerId, config: &ClientConfig) -> Result<T
     };
     disable_nagle(&stream);
 
-    let run = handshake_as_initiator(&mut stream, peer, config);
-    let (handshake, rtt) = match tokio::time::timeout(config.handshake_timeout, run).await {
-        Ok(result) => result?,
-        Err(_) => return Err(TransportError::Timeout),
-    };
-
-    // IK authenticates the responder by construction, so this can only fire if
-    // something is deeply wrong. Checked anyway: proceeding on a connection
-    // whose peer is not who we dialled is never the right recovery.
-    let remote = handshake
-        .remote_static()
-        .ok_or(TransportError::HandshakeFailed)?;
-    if &remote != peer.noise_key() {
-        return Err(TransportError::WrongPeer);
-    }
-
-    let rtt_ms = u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX);
-    finish(
-        stream,
-        addr,
-        handshake,
-        remote,
-        Role::Initiator,
-        config.mux,
-        Some(rtt_ms),
-    )
-}
-
-/// Writes message 1, reads message 2, and measures the round trip.
-async fn handshake_as_initiator(
-    stream: &mut TcpStream,
-    peer: PeerId,
-    config: &ClientConfig,
-) -> Result<(Handshake, Duration)> {
     let psk = config.psk.clone();
-    let mut handshake = Handshake::initiator(
+    let run = handshake::initiate(
+        &mut stream,
         &config.identity,
         peer.noise_key(),
         config.purpose,
         psk.as_deref(),
-    )
-    .map_err(from_session)?;
+    );
+    let authenticated = match tokio::time::timeout(config.handshake_timeout, run).await {
+        Ok(result) => result?,
+        Err(_) => return Err(TransportError::Timeout),
+    };
 
-    let mut buf = vec![0u8; NOISE_MAX_MESSAGE_LEN];
-    let mut scratch = vec![0u8; NOISE_MAX_MESSAGE_LEN];
-
-    let len = handshake
-        .write_message(&[], &mut buf)
-        .map_err(|_| TransportError::HandshakeFailed)?;
-
-    // The RTT sample the UI shows is taken here: one flight out, one back, with
-    // no application work in between, so it measures the path and not the
-    // daemon's scheduler.
-    let started = Instant::now();
-    write_handshake(stream, &buf[..len]).await?;
-    let len = read_handshake(stream, &mut buf).await?;
-    let rtt = started.elapsed();
-
-    handshake
-        .read_message(&buf[..len], &mut scratch)
-        .map_err(|_| TransportError::HandshakeFailed)?;
-    Ok((handshake, rtt))
+    finish(stream, addr, authenticated, Role::Initiator, config.mux)
 }
 
 /// Turns off Nagle's algorithm, tolerating a platform that refuses.
@@ -751,15 +640,15 @@ fn disable_nagle(stream: &TcpStream) {
 fn finish(
     stream: TcpStream,
     addr: SocketAddr,
-    handshake: Handshake,
-    peer: PublicKey,
+    authenticated: Authenticated,
     role: Role,
     mux_cfg: MuxConfig,
-    rtt_ms: Option<u32>,
 ) -> Result<TcpConnection> {
-    if !handshake.is_finished() {
-        return Err(TransportError::HandshakeFailed);
-    }
+    let Authenticated {
+        handshake,
+        peer,
+        rtt,
+    } = authenticated;
     let sas = handshake.sas().map_err(from_session)?;
     let session: Session = handshake.into_session().map_err(from_session)?;
     let channel_binding = *session.channel_binding();
@@ -768,8 +657,8 @@ fn finish(
     let mux = Mux::spawn(read, write, session, role, mux_cfg)?;
 
     let mut info = PathInfo::lan();
-    if let Some(rtt_ms) = rtt_ms {
-        info = info.with_rtt_ms(rtt_ms);
+    if let Some(rtt) = rtt {
+        info = info.with_rtt_ms(u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX));
     }
     let (path_tx, _) = watch::channel(info);
 
@@ -781,52 +670,6 @@ fn finish(
         channel_binding,
         path_tx,
     })
-}
-
-/// Writes one length-prefixed handshake message.
-async fn write_handshake<S>(stream: &mut S, message: &[u8]) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    let len = u16::try_from(message.len()).map_err(|_| TransportError::HandshakeFailed)?;
-    // One write, so the prefix and the body cannot be split across a packet
-    // boundary by Nagle being off.
-    let mut out = Vec::with_capacity(2 + message.len());
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(message);
-    stream
-        .write_all(&out)
-        .await
-        .map_err(|_| TransportError::HandshakeFailed)?;
-    stream
-        .flush()
-        .await
-        .map_err(|_| TransportError::HandshakeFailed)
-}
-
-/// Reads one length-prefixed handshake message into `buf`.
-///
-/// Bounded by `buf`, which is sized to the Noise maximum, so a peer cannot make
-/// this allocate. An empty or over-long message is refused before any read of
-/// the body.
-async fn read_handshake<S>(stream: &mut S, buf: &mut [u8]) -> Result<usize>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut prefix = [0u8; 2];
-    stream
-        .read_exact(&mut prefix)
-        .await
-        .map_err(|_| TransportError::HandshakeFailed)?;
-    let len = usize::from(u16::from_be_bytes(prefix));
-    if len == 0 || len > buf.len() {
-        return Err(TransportError::HandshakeFailed);
-    }
-    stream
-        .read_exact(&mut buf[..len])
-        .await
-        .map_err(|_| TransportError::HandshakeFailed)?;
-    Ok(len)
 }
 
 #[cfg(test)]

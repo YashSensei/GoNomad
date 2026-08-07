@@ -1,6 +1,6 @@
 [package]
 name = "gonomad-transport"
-description = "GoNomad transport: LAN TCP + Noise today, behind the trait iroh will implement."
+description = "GoNomad transport: LAN TCP and hole-punched QUIC over iroh, behind one Noise-authenticated interface."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,13 @@ gonomad-core = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Tiers 1 and 2 of the ladder: hole-punched direct QUIC and relayed QUIC
+# (ARCHITECTURE.md §4.3). This is the dependency that makes GoNomad work when
+# the phone is on mobile data and the laptop is behind a home router.
+iroh = { workspace = true }
+# Only for `StreamExt::next` over iroh's path-event stream. Pulled in rather
+# than hand-rolling a `poll_next` loop, and used nowhere else in this crate.
+futures = { workspace = true }
 # The pairing PSK is held in a wiping buffer for as long as a server config
 # lives, which can be the whole 120-second pairing window (ARCHITECTURE.md §9).
 zeroize = { workspace = true }

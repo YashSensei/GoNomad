@@ -62,6 +62,14 @@ zeroize = { version = "1.8", features = ["derive"] }
 # Noise IK session layer. Layered inside QUIC deliberately, so that security is
 # independent of transport and adding a tunnel fallback cannot weaken it (§3.4).
 snow = "0.9"
+
+# --- Transport: NAT traversal (ARCHITECTURE.md §4.3) ---
+# QUIC keyed by public key rather than IP, with hole punching and a relay
+# fallback. This is what lets the phone reach the laptop across different
+# networks with no port forwarding. Verified to cross-compile for
+# aarch64-linux-android; it uses `ring` rather than aws-lc-rs, which is why it
+# needs no C toolchain.
+iroh = "1.0.3"
 # Crockford base32 for the manual pairing code: no ambiguous 0/O or 1/I/l, which
 # matters when a human is reading digits off a laptop screen (§9.3).
 data-encoding = "2.6"

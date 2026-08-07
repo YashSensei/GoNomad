@@ -93,6 +93,7 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::error::{from_session, ProtocolViolation, Result, TransportError};
+use crate::stream::{RecvStream, SendStream};
 
 /// Identifies one logical stream inside a connection.
 pub type ChannelId = u32;
@@ -189,10 +190,11 @@ pub struct MuxConfig {
     /// deadlock unrepresentable.
     ///
     /// QUIC does not need this cap, because its flow control operates on a byte
-    /// stream rather than on whole application messages. When iroh lands, this
-    /// field goes away and 32 MiB single-frame responses become possible again.
-    /// Until then, larger responses chunk across frames and terminate with
-    /// [`gonomad_proto::FrameFlags::LAST`] — which is what that flag is for.
+    /// stream rather than on whole application messages, so
+    /// [`crate::IrohConfig::max_frame_len`] defaults to the protocol's full
+    /// 32 MiB. On *this* binding, larger responses chunk across frames and
+    /// terminate with [`gonomad_proto::FrameFlags::LAST`] — which is what that flag
+    /// is for.
     pub max_frame_len: usize,
 
     /// Maximum concurrently open channels, in each direction combined.
@@ -292,7 +294,7 @@ impl Segment {
 struct ChannelState {
     /// Bytes this side may still send. Replenished by the peer's WINDOW updates.
     credit: Arc<Semaphore>,
-    /// Delivers reassembled frames to the [`RecvStream`].
+    /// Delivers reassembled frames to the [`MuxRecv`].
     ///
     /// Unbounded by count, bounded by *credit* in bytes: the peer cannot have
     /// more than one window of unconsumed data outstanding, so an unbounded
@@ -394,18 +396,18 @@ impl Shared {
             shared: Arc::clone(self),
         });
         (
-            SendStream {
+            SendStream::from_mux(MuxSend {
                 id,
                 credit,
                 shared: Arc::clone(self),
                 _guard: Arc::clone(&guard),
-            },
-            RecvStream {
+            }),
+            RecvStream::from_mux(MuxRecv {
                 id,
                 rx,
                 shared: Arc::clone(self),
                 _guard: guard,
-            },
+            }),
         )
     }
 
@@ -558,7 +560,7 @@ impl Shared {
         inner.out.clear();
         // Dropped so a caller parked in `accept_bi` learns the link is gone.
         inner.accept_tx = None;
-        // Dropping the inbound senders is what makes `RecvStream::recv` return,
+        // Dropping the inbound senders is what makes `MuxRecv::recv` return,
         // and closing the semaphores is what unparks a sender blocked on credit.
         // Without both, a peer that vanishes leaves tasks waiting forever.
         for state in inner.channels.values_mut() {
@@ -589,7 +591,7 @@ impl Inner {
 /// Sending parks when the channel is out of credit. That parking is the whole
 /// point: it happens on *this* channel's future, not on the connection, so a
 /// bulk transfer waiting for window does not delay a keystroke.
-pub struct SendStream {
+pub(crate) struct MuxSend {
     id: ChannelId,
     credit: Arc<Semaphore>,
     shared: Arc<Shared>,
@@ -597,10 +599,9 @@ pub struct SendStream {
     _guard: Arc<ChannelGuard>,
 }
 
-impl SendStream {
-    /// This stream's channel id.
-    #[must_use]
-    pub const fn id(&self) -> ChannelId {
+impl MuxSend {
+    /// This channel's id.
+    pub(crate) const fn id(&self) -> ChannelId {
         self.id
     }
 
@@ -616,7 +617,7 @@ impl SendStream {
     /// [`MuxConfig::max_frame_len`], [`TransportError::StreamClosed`] when the
     /// channel has been torn down, or the connection's close reason once the
     /// link is gone.
-    pub async fn send(&mut self, frame: &Frame) -> Result<()> {
+    pub(crate) async fn send(&mut self, frame: &Frame) -> Result<()> {
         let max = self.shared.cfg.max_frame_len;
         if frame.payload.len() > max {
             return Err(TransportError::FrameTooLarge {
@@ -645,7 +646,7 @@ impl SendStream {
     }
 
     /// Closes the channel in both directions and tells the peer.
-    pub fn finish(self) {
+    pub(crate) fn finish(self) {
         self.shared.close_channel(self.id);
     }
 
@@ -658,17 +659,8 @@ impl SendStream {
     }
 }
 
-impl core::fmt::Debug for SendStream {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("SendStream")
-            .field("channel", &self.id)
-            .field("credit", &self.credit.available_permits())
-            .finish_non_exhaustive()
-    }
-}
-
 /// The read half of a logical stream.
-pub struct RecvStream {
+pub(crate) struct MuxRecv {
     id: ChannelId,
     rx: mpsc::UnboundedReceiver<Frame>,
     shared: Arc<Shared>,
@@ -676,10 +668,9 @@ pub struct RecvStream {
     _guard: Arc<ChannelGuard>,
 }
 
-impl RecvStream {
-    /// This stream's channel id.
-    #[must_use]
-    pub const fn id(&self) -> ChannelId {
+impl MuxRecv {
+    /// This channel's id.
+    pub(crate) const fn id(&self) -> ChannelId {
         self.id
     }
 
@@ -694,7 +685,7 @@ impl RecvStream {
     ///
     /// Returns [`TransportError::ConnectionLost`] after an abrupt disconnect, or
     /// the specific protocol violation that tore the connection down.
-    pub async fn recv(&mut self) -> Result<Option<Frame>> {
+    pub(crate) async fn recv(&mut self) -> Result<Option<Frame>> {
         match self.rx.recv().await {
             Some(frame) => {
                 // Credit is returned on *consumption*, not on arrival. Returning
@@ -716,14 +707,6 @@ impl RecvStream {
                 }
             }
         }
-    }
-}
-
-impl core::fmt::Debug for RecvStream {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("RecvStream")
-            .field("channel", &self.id)
-            .finish_non_exhaustive()
     }
 }
 
@@ -1190,6 +1173,7 @@ fn peer_reset(shared: &Arc<Shared>, channel: ChannelId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::CONTROL_STREAM;
     use gonomad_core::{DeviceIdentity, Handshake, Purpose};
     use gonomad_proto::FrameFlags;
 
@@ -1292,10 +1276,10 @@ mod tests {
     async fn the_initiators_first_channel_is_the_control_channel() {
         let (client, daemon) = linked(MuxConfig::default());
         let (mut tx, _rx) = client.open_bi().expect("open");
-        assert_eq!(tx.id(), CONTROL_CHANNEL);
+        assert_eq!(tx.id(), CONTROL_STREAM);
         tx.send(&frame(b"hello")).await.expect("send");
         let (_, mut server_rx) = daemon.accept_bi().await.expect("accept");
-        assert_eq!(server_rx.id(), CONTROL_CHANNEL);
+        assert_eq!(server_rx.id(), CONTROL_STREAM);
         assert_eq!(
             server_rx
                 .recv()

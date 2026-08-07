@@ -49,7 +49,7 @@ anyhow = "1.0"
 
 # --- Crypto (ARCHITECTURE.md §3) ---
 blake3 = "1.5"
-ed25519-dalek = { version = "2.1", features = ["rand_core", "zeroize"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core", "zeroize"] }
 # X25519 for the Noise static key. Separate from the Ed25519 signing key: an
 # Ed25519 public key is NOT a valid X25519 public key even when both derive from
 # the same seed, so the two are distinct domain-separated subkeys (see

@@ -12,7 +12,7 @@
 //! pattern: the daemon's listener is configured for one purpose or the other by
 //! the operator, never by the peer.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -20,10 +20,61 @@ use gonomad_core::{DeviceIdentity, PairingSecret};
 use gonomad_proto::{ControlMessage, Frame, FrameFlags, PublicKey};
 use gonomad_store::Store;
 use gonomad_transport::{
-    Allowlist, Conn, IrohConfig, IrohTransport, ServerConfig, TcpTransport, DEFAULT_PORT,
+    Allowlist, Conn, IrohConfig, IrohTransport, PeerPolicy, ServerConfig, TcpTransport,
+    DEFAULT_PORT,
 };
 
 use crate::router::{Daemon, Effect, Router};
+
+/// A [`PeerPolicy`] that answers from the database on every handshake.
+///
+/// The alternative — snapshotting `list_active()` once at startup — makes
+/// revocation a no-op until the daemon is restarted, which contradicts §3.6.
+/// Worse, it fails in the direction that matters: a device the user explicitly
+/// revoked keeps connecting.
+///
+/// Re-reading is necessary rather than merely tidy, because `gonomad devices
+/// revoke` runs in a **different process** and edits the SQLite file directly. No
+/// in-process channel can observe that; only a fresh read can.
+///
+/// One query per handshake is affordable — handshakes happen per connection, not
+/// per request — and this deliberately does *not* cache. A TTL here would be a
+/// window during which a revoked key still works, which is the whole bug.
+struct LiveAllowlist {
+    /// `Mutex` because `rusqlite::Connection` is `Send` but not `Sync`, and
+    /// [`PeerPolicy`] requires `Sync`. Held only for the duration of one indexed
+    /// read, with no `await` inside, so it cannot stall the runtime.
+    store: Arc<Mutex<Store>>,
+}
+
+impl PeerPolicy for LiveAllowlist {
+    fn authorize(&self, peer: &PublicKey) -> bool {
+        let keys = {
+            let Ok(store) = self.store.lock() else {
+                // A poisoned lock means another thread panicked mid-read. Fail
+                // closed: the paired-device list is unreadable, so no key can be
+                // shown to be on it.
+                tracing::error!("the device database lock is poisoned; refusing the peer");
+                return false;
+            };
+            match store.devices().list_active() {
+                Ok(devices) => devices.iter().map(|d| d.public_key).collect::<Vec<_>>(),
+                Err(error) => {
+                    // Fail closed for the same reason. An unreadable database is
+                    // not evidence that a peer is authorised.
+                    tracing::error!(%error, "could not read the device list; refusing the peer");
+                    return false;
+                }
+            }
+        };
+
+        // Delegated rather than compared here so the constant-time scan in
+        // `Allowlist` stays the single implementation of this check — including
+        // its property of visiting every entry so the matching *position* does not
+        // leak through timing.
+        Allowlist::new(keys).authorize(peer)
+    }
+}
 
 /// A device that completed pairing.
 #[derive(Debug, Clone)]
@@ -187,19 +238,24 @@ pub async fn serve_iroh(
     daemon: Arc<Daemon>,
     store: Store,
 ) -> Result<()> {
-    let allowed: Vec<PublicKey> = store
+    let paired_at_start = store
         .devices()
         .list_active()
         .context("could not read the device list")?
-        .iter()
-        .map(|d| d.public_key)
-        .collect();
+        .len();
 
-    if allowed.is_empty() {
+    // Only a startup courtesy, so `gonomad serve` with nothing paired says so
+    // instead of waiting silently forever. It is *not* the authorisation decision:
+    // that is `LiveAllowlist`, which re-reads per handshake, so a device paired
+    // after this point is admitted without a restart.
+    if paired_at_start == 0 {
         bail!("no devices are paired — run `gonomad pair` first");
     }
 
-    let policy = Arc::new(Allowlist::new(allowed.clone()));
+    let store = Arc::new(Mutex::new(store));
+    let policy = Arc::new(LiveAllowlist {
+        store: Arc::clone(&store),
+    });
     let transport = IrohTransport::bind(IrohConfig::reconnect(identity, policy))
         .await
         .context("could not start the iroh endpoint")?;
@@ -210,8 +266,8 @@ pub async fn serve_iroh(
     transport.online().await;
 
     println!("  node id     {}", transport.node_id().short());
-    println!("  devices     {}", allowed.len());
-    tracing::info!(devices = allowed.len(), "serving over iroh");
+    println!("  devices     {paired_at_start}");
+    tracing::info!(devices = paired_at_start, "serving over iroh");
 
     loop {
         let conn = match transport.accept_iroh().await {
@@ -224,10 +280,13 @@ pub async fn serve_iroh(
 
         let peer = conn.peer_key();
         let device_id = gonomad_proto::DeviceId::from_public_key(&peer);
-        let grant = gonomad_policy::DeviceGrant::new(
-            device_id,
-            store.devices().grants(&device_id).unwrap_or_default(),
-        );
+        // Read afresh here too, so a capability changed on the machine applies to
+        // the next connection rather than to the next daemon restart.
+        let granted = store
+            .lock()
+            .map(|store| store.devices().grants(&device_id).unwrap_or_default())
+            .unwrap_or_default();
+        let grant = gonomad_policy::DeviceGrant::new(device_id, granted);
 
         tracing::info!(
             device = %device_id.short(),
@@ -512,4 +571,94 @@ async fn send(tx: &mut gonomad_transport::SendStream, message: &ControlMessage) 
     let frame = Frame::cbor(FrameFlags::LAST, message).context("could not encode a response")?;
     tx.send(&frame).await.context("could not send a response")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use gonomad_proto::{CapabilitySet, DeviceId};
+
+    use super::{Arc, LiveAllowlist, Mutex, PeerPolicy, PublicKey, Store};
+
+    /// Builds a live allowlist over an empty in-memory database.
+    fn allowlist() -> (LiveAllowlist, Arc<Mutex<Store>>) {
+        let store = Arc::new(Mutex::new(
+            Store::open_in_memory().expect("open an in-memory store"),
+        ));
+        (
+            LiveAllowlist {
+                store: Arc::clone(&store),
+            },
+            store,
+        )
+    }
+
+    #[test]
+    fn revoking_a_device_takes_effect_without_restarting_the_daemon() {
+        // `ARCHITECTURE.md` §3.6 and §19 R29. The bug this pins: building the
+        // allowlist once at startup made `gonomad devices revoke` a no-op until the
+        // daemon was restarted, so a device the user had explicitly cut off kept
+        // connecting. The policy object here is created ONCE and never rebuilt —
+        // that is the whole point, because it stands in for a daemon that is still
+        // running while the device list changes underneath it.
+        let (policy, store) = allowlist();
+        let key = PublicKey::from_bytes([7; 32]);
+
+        // Not paired yet, so refused.
+        assert!(
+            !policy.authorize(&key),
+            "an unknown key must never be authorised"
+        );
+
+        store
+            .lock()
+            .expect("lock")
+            .devices()
+            .pair(&key, "Pixel 9", None, CapabilitySet::default_grant())
+            .expect("pair");
+        assert!(
+            policy.authorize(&key),
+            "a freshly paired device must be admitted without a restart"
+        );
+
+        assert!(store
+            .lock()
+            .expect("lock")
+            .devices()
+            .revoke(&DeviceId::from_public_key(&key))
+            .expect("revoke"));
+        assert!(
+            !policy.authorize(&key),
+            "a revoked device must be refused by the same policy object, with no restart"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_device_list_refuses_the_peer_rather_than_admitting_it() {
+        // Fail closed. An unreadable database is not evidence that a key is on the
+        // allowlist, and the safe default for an authorisation check that cannot
+        // reach its data is "no".
+        let (policy, store) = allowlist();
+        let key = PublicKey::from_bytes([9; 32]);
+        store
+            .lock()
+            .expect("lock")
+            .devices()
+            .pair(&key, "Pixel 9", None, CapabilitySet::default_grant())
+            .expect("pair");
+        assert!(policy.authorize(&key), "sanity: the device is paired");
+
+        // Poison the lock, which is what a panic in another thread leaves behind.
+        let poisoned = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("lock");
+            panic!("poison the mutex on purpose");
+        })
+        .join()
+        .expect_err("the thread panicked as intended");
+
+        assert!(
+            !policy.authorize(&key),
+            "a poisoned lock must refuse, not admit"
+        );
+    }
 }

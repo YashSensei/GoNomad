@@ -20,8 +20,8 @@ use gonomad_core::{DeviceIdentity, PairingSecret};
 use gonomad_proto::{ControlMessage, Frame, FrameFlags, PublicKey};
 use gonomad_store::Store;
 use gonomad_transport::{
-    Allowlist, Conn, IrohConfig, IrohTransport, PeerPolicy, ServerConfig, TcpTransport,
-    DEFAULT_PORT,
+    Allowlist, Conn, IrohConfig, IrohConnection, IrohTransport, PeerPolicy, ServerConfig,
+    TcpTransport, DEFAULT_PORT,
 };
 
 use crate::router::{Daemon, Effect, Router};
@@ -74,6 +74,87 @@ impl PeerPolicy for LiveAllowlist {
         // leak through timing.
         Allowlist::new(keys).authorize(peer)
     }
+}
+
+/// How often live connections are re-checked against the device list.
+///
+/// This is the interval that turns "revocation applies to the next connection"
+/// into "revocation applies within five seconds", which is what §3.6's
+/// next-packet promise means in practice for a session already open.
+///
+/// Five seconds is chosen against the alternative rather than by feel. Checking
+/// per request is the obvious reading of "next packet" and is the wrong design: a
+/// phone polling `pty.screen` would make an indexed SQLite read part of the
+/// terminal hot path, so the cost would scale with typing speed. A sweep costs one
+/// read per interval no matter how busy the connection is, and five seconds is
+/// short enough that a user who taps *Revoke* sees the device drop while still
+/// looking at the screen.
+const REVOCATION_SWEEP: Duration = Duration::from_secs(5);
+
+/// Connections currently being served, so revocation can reach an open one.
+///
+/// A `Vec` rather than a map because a user pairs a handful of devices and one
+/// device may legitimately hold more than one connection; a linear scan of that is
+/// free, and it avoids deciding what a duplicate key should mean.
+type LiveConnections = Arc<Mutex<Vec<(gonomad_proto::DeviceId, Arc<IrohConnection>)>>>;
+
+/// Closes live connections whose device has stopped being active.
+///
+/// Runs until the daemon exits. Without it, authorisation would only ever be
+/// checked at handshake time, so revoking a device that already holds an open
+/// connection would leave that connection working indefinitely — which for a
+/// long-lived terminal session could be hours.
+async fn sweep_revoked(store: Arc<Mutex<Store>>, live: LiveConnections) {
+    loop {
+        tokio::time::sleep(REVOCATION_SWEEP).await;
+        sweep_once(&store, &live);
+    }
+}
+
+/// One pass of the revocation sweep.
+///
+/// Split from the loop so it can be tested against a real connection without
+/// waiting on a timer. Entirely synchronous, and holds each lock only long enough
+/// to read it — nothing here can stall the runtime.
+fn sweep_once(store: &Arc<Mutex<Store>>, live: &LiveConnections) {
+    let active: Vec<gonomad_proto::DeviceId> = {
+        let Ok(store) = store.lock() else {
+            // Permanent once poisoned, so this would otherwise fail silently and
+            // for ever. Logged every round on purpose. Not treated as "revoke
+            // everything": an unreadable list is no evidence that any particular
+            // device was revoked, and tearing down every session over it would be a
+            // self-inflicted outage. New connections are already refused by
+            // `LiveAllowlist` in this state.
+            tracing::error!("device database lock poisoned; cannot sweep for revocations");
+            return;
+        };
+        match store.devices().list_active() {
+            Ok(devices) => devices.iter().map(|d| d.id).collect(),
+            Err(error) => {
+                tracing::error!(%error, "could not read the device list while sweeping");
+                return;
+            }
+        }
+    };
+
+    let Ok(mut live) = live.lock() else {
+        tracing::error!("connection registry lock poisoned; cannot sweep for revocations");
+        return;
+    };
+    live.retain(|(device_id, conn)| {
+        if conn.is_closed() {
+            return false;
+        }
+        if active.contains(device_id) {
+            return true;
+        }
+        tracing::info!(
+            device = %device_id.short(),
+            "closing a live connection: the device is no longer active"
+        );
+        conn.close();
+        false
+    });
 }
 
 /// A device that completed pairing.
@@ -269,6 +350,9 @@ pub async fn serve_iroh(
     println!("  devices     {paired_at_start}");
     tracing::info!(devices = paired_at_start, "serving over iroh");
 
+    let live: LiveConnections = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn(sweep_revoked(Arc::clone(&store), Arc::clone(&live)));
+
     loop {
         let conn = match transport.accept_iroh().await {
             Ok(conn) => conn,
@@ -277,6 +361,10 @@ pub async fn serve_iroh(
                 continue;
             }
         };
+        // Shared with the registry so the sweep can close a connection this task is
+        // still serving. Closing it is what makes the reads below fail, which ends
+        // the task — the sweep does not need to reach into the task itself.
+        let conn = Arc::new(conn);
 
         let peer = conn.peer_key();
         let device_id = gonomad_proto::DeviceId::from_public_key(&peer);
@@ -295,13 +383,32 @@ pub async fn serve_iroh(
         );
         let daemon = Arc::clone(&daemon);
 
+        // Registered *before* the task starts, so there is no window in which a
+        // connection is being served but is invisible to the sweep.
+        if let Ok(mut live) = live.lock() {
+            live.push((device_id, Arc::clone(&conn)));
+        } else {
+            // The sweep could never reach this connection, so serving it would mean
+            // a session revocation cannot touch. Refuse it instead.
+            tracing::error!("connection registry lock poisoned; dropping the connection");
+            conn.close();
+            continue;
+        }
+
+        let live_for_task = Arc::clone(&live);
         tokio::spawn(async move {
             let mut router = Router::established(daemon, peer, grant);
             let no_registration = |_: &PublicKey, _: &str, _: Option<&str>| Ok(());
-            if let Err(e) = serve_connection(&conn, &mut router, no_registration).await {
+            if let Err(e) = serve_connection(&*conn, &mut router, no_registration).await {
                 tracing::debug!(error = %e, "connection ended");
             }
             tracing::info!(device = %device_id.short(), "device disconnected");
+            // Deregister promptly rather than waiting for the sweep to notice, so a
+            // daemon serving many short connections does not accumulate dead
+            // entries for up to one sweep interval.
+            if let Ok(mut live) = live_for_task.lock() {
+                live.retain(|(_, registered)| !Arc::ptr_eq(registered, &conn));
+            }
         });
     }
 }
@@ -577,7 +684,10 @@ async fn send(tx: &mut gonomad_transport::SendStream, message: &ControlMessage) 
 mod tests {
     use gonomad_proto::{CapabilitySet, DeviceId};
 
-    use super::{Arc, LiveAllowlist, Mutex, PeerPolicy, PublicKey, Store};
+    use super::{
+        Allowlist, Arc, IrohConfig, IrohConnection, IrohTransport, LiveAllowlist, LiveConnections,
+        Mutex, PeerPolicy, PublicKey, Store,
+    };
 
     /// Builds a live allowlist over an empty in-memory database.
     fn allowlist() -> (LiveAllowlist, Arc<Mutex<Store>>) {
@@ -629,6 +739,115 @@ mod tests {
         assert!(
             !policy.authorize(&key),
             "a revoked device must be refused by the same policy object, with no restart"
+        );
+    }
+
+    /// Binds two loopback-only iroh endpoints and returns one live connection.
+    ///
+    /// Relay and address lookup are off and the address is pinned, so this needs no
+    /// network at all — the same shape `gonomad-transport`'s own tests use.
+    /// Both endpoints are returned, not just the connection. iroh tears down every
+    /// connection on a dropped endpoint (§19 R28), so a helper that returned the
+    /// connection alone would hand back something already dying.
+    async fn connected_pair(
+        daemon: &Arc<gonomad_core::DeviceIdentity>,
+        phone: &Arc<gonomad_core::DeviceIdentity>,
+    ) -> (IrohConnection, IrohTransport, IrohTransport) {
+        use gonomad_transport::{AddrHint, PeerId, RelayPolicy};
+
+        let local = |base: IrohConfig| IrohConfig {
+            relay: RelayPolicy::Disabled,
+            address_lookup: false,
+            bind_addrs: vec!["127.0.0.1:0".parse().expect("literal")],
+            ..base
+        };
+
+        let listener = IrohTransport::bind(local(IrohConfig::reconnect(
+            Arc::clone(daemon),
+            Arc::new(Allowlist::new(vec![phone.noise_public_key()])),
+        )))
+        .await
+        .expect("bind the daemon endpoint");
+
+        let mut hints = vec![AddrHint::Node(listener.node_id())];
+        hints.extend(listener.bound_sockets().into_iter().map(AddrHint::Direct));
+
+        let dialer = IrohTransport::bind(local(IrohConfig::dialer(Arc::clone(phone))))
+            .await
+            .expect("bind the phone endpoint");
+
+        let dialing = tokio::spawn({
+            let peer = PeerId::from_noise_key(daemon.noise_public_key());
+            async move {
+                let conn = dialer
+                    .connect_iroh(peer, &hints)
+                    .await
+                    .expect("dial the daemon");
+                // Returned so the dialling endpoint outlives the connection: iroh
+                // tears down every connection on a dropped endpoint (§19 R28).
+                (conn, dialer)
+            }
+        });
+
+        let accepted = listener.accept_iroh().await.expect("accept");
+        let (_client_conn, dialer) = dialing.await.expect("the dial task");
+        (accepted, listener, dialer)
+    }
+
+    #[tokio::test]
+    async fn revoking_a_device_closes_the_connection_it_already_holds() {
+        // The other half of R29. Handshake-time authorisation alone would leave a
+        // revoked device's open session working indefinitely — for a terminal that
+        // could be hours. This asserts the sweep reaches an already-established
+        // connection, using a real iroh connection rather than a stand-in, because
+        // the property being tested *is* that a real connection gets closed.
+        let daemon = Arc::new(gonomad_core::DeviceIdentity::generate());
+        let phone = Arc::new(gonomad_core::DeviceIdentity::generate());
+        // Both endpoints held for the whole test: the accepted connection lives on
+        // `_listener`, and dropping either would close the connection for reasons
+        // that have nothing to do with revocation.
+        let (conn, _listener, _dialer) = connected_pair(&daemon, &phone).await;
+
+        let (_policy, store) = allowlist();
+        let device = store
+            .lock()
+            .expect("lock")
+            .devices()
+            .pair(
+                &phone.public_key(),
+                "Pixel 9",
+                None,
+                CapabilitySet::default_grant(),
+            )
+            .expect("pair");
+
+        let conn = Arc::new(conn);
+        let live: LiveConnections = Arc::new(Mutex::new(vec![(device.id, Arc::clone(&conn))]));
+
+        // Still paired, so the sweep must leave it strictly alone.
+        super::sweep_once(&store, &live);
+        assert_eq!(
+            live.lock().expect("lock").len(),
+            1,
+            "a paired device's connection was dropped"
+        );
+        assert!(!conn.is_closed(), "a paired device's connection was closed");
+
+        assert!(store
+            .lock()
+            .expect("lock")
+            .devices()
+            .revoke(&device.id)
+            .expect("revoke"));
+
+        super::sweep_once(&store, &live);
+        assert!(
+            conn.is_closed(),
+            "revoking a device left its open connection alive"
+        );
+        assert!(
+            live.lock().expect("lock").is_empty(),
+            "the closed connection was left in the registry"
         );
     }
 

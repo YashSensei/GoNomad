@@ -2,6 +2,17 @@
 # reflectively. R8 cannot see any of those edges, so all of it has to be kept or
 # a minified release build fails at the first FFI call rather than at build time.
 
+# JNA is built for desktop JVMs and references java.awt for its window/component
+# helpers. Those classes do not exist on Android at all, so R8 reports them as
+# missing and fails the build. The referencing code (com.sun.jna.Native$AWT) is
+# unreachable here — nothing in GoNomad asks JNA for a window handle — so telling
+# R8 not to warn is correct rather than a workaround.
+#
+# Found by actually building a release APK. The debug build never runs R8, so this
+# was invisible until the first `assembleRelease`.
+-dontwarn java.awt.**
+-dontwarn javax.swing.**
+
 # JNA itself: Structure subclasses are read field-by-field by name, Callback
 # implementations are invoked from native code, and Library interfaces are
 # implemented at runtime by a proxy.

@@ -1,9 +1,22 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
 }
+
+// Release signing credentials, loaded from a git-ignored file.
+//
+// Absent on a fresh clone and in CI, which is deliberate: the build still works,
+// it just cannot produce a signed release. Failing the whole build because a
+// contributor has no signing key would be hostile, so `assembleRelease` simply
+// falls back to unsigned and says so.
+val keystoreProps: Properties? =
+    rootProject.file("keystore.properties").takeIf { it.exists() }?.let { file ->
+        Properties().also { props -> file.inputStream().use(props::load) }
+    }
 
 android {
     namespace = "dev.gonomad.app"
@@ -33,6 +46,22 @@ android {
         }
     }
 
+    signingConfigs {
+        keystoreProps?.let { props ->
+            create("release") {
+                storeFile = rootProject.file(props.getProperty("storeFile"))
+                storePassword = props.getProperty("storePassword")
+                keyAlias = props.getProperty("keyAlias")
+                keyPassword = props.getProperty("keyPassword")
+                // v1 as well as v2/v3: v1 is what lets the APK install by tapping
+                // it in a file manager on older Android, which is exactly how a
+                // sideloaded build gets installed.
+                enableV1Signing = true
+                enableV2Signing = true
+            }
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
@@ -40,13 +69,13 @@ android {
             versionNameSuffix = "-debug"
         }
         release {
-            // No release signing in this milestone; assembleDebug is the target.
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 

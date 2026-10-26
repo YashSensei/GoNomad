@@ -95,7 +95,7 @@ jobs:
       # project is meant to close (ARCHITECTURE.md §3.11). The trailing comment
       # records the human-readable version so Dependabot can bump it.
       - name: Cache cargo registry, git checkouts and target/
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Keyed per-OS so a Windows target/ directory never restores over a
           # Linux one. rust-cache also folds in the rustc version and the
@@ -126,7 +126,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache cargo registry, git checkouts and target/
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.os }}
           cache-on-failure: true
@@ -152,7 +152,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache cargo registry, git checkouts and target/
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.os }}
           cache-on-failure: true
